@@ -1,0 +1,261 @@
+name: Permanent RDP
+on: 
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Duration in hours (default: 12)'
+        required: false
+        default: '12'
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 43200
+    steps:
+      - name: Configure RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+          
+          # Disable sleep/power saving
+          powercfg /change standby-timeout-ac 0
+          powercfg /change standby-timeout-dc 0
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change monitor-timeout-dc 0
+          
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+          
+          Restart-Service -Name TermService -Force
+
+      - name: Create Fixed User
+        run: |
+          $password = "RDP@Secure2026!@#"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name "RDP" -Force
+          }
+          
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale with Retry
+        run: |
+          $maxRetries = 5
+          $retryCount = 0
+          $success = $false
+          
+          while (-not $success -and $retryCount -lt $maxRetries) {
+            try {
+              $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+              $installerPath = "$env:TEMP\tailscale.msi"
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -TimeoutSec 60
+              Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
+              Remove-Item $installerPath -Force
+              $success = $true
+              Write-Host "✅ Tailscale installed successfully"
+            } catch {
+              $retryCount++
+              Write-Host "⚠️ Installation attempt $retryCount failed, retrying..."
+              Start-Sleep -Seconds 10
+            }
+          }
+
+      - name: Advanced Tailscale Setup
+        run: |
+          # Kill any existing Tailscale processes
+          Get-Process -Name "tailscale" -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-Process -Name "tailscaled" -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 5
+          
+          # Set Tailscale to use stable connection
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" logout 2>$null
+          Start-Sleep -Seconds 3
+          
+          # Connect with multiple fallback options
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=rdp-permanent `
+            --accept-routes=true `
+            --accept-dns=false `
+            --reset `
+            --advertise-exit-node=false
+          
+          Start-Sleep -Seconds 10
+          
+          # Get IP with retry
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 30) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            if (-not $tsIP) {
+              Write-Host "⏳ Waiting for Tailscale IP... ($retries/30)"
+              Start-Sleep -Seconds 5
+              $retries++
+            }
+          }
+          
+          if (-not $tsIP) {
+            Write-Error "❌ Failed to get Tailscale IP"
+            exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          echo "TS_IP=$tsIP" >> $env:GITHUB_ENV
+          
+          # Save IP to multiple locations
+          $tsIP | Out-File -FilePath "$env:TEMP\tailscale_ip.txt"
+          $tsIP | Out-File -FilePath "C:\tailscale_ip.txt"
+          
+          Write-Host "✅ Tailscale IP: $tsIP"
+
+      - name: Verify Connection
+        run: |
+          Write-Host "`n=================================================="
+          Write-Host "   🚀 RDP ACCESS (STABLE CONNECTION) 🚀"
+          Write-Host "=================================================="
+          Write-Host "📍 IP Address: $env:TAILSCALE_IP"
+          Write-Host "👤 Username: RDP"
+          Write-Host "🔑 Password: $env:RDP_PASSWORD"
+          Write-Host "=================================================="
+          
+          # Test connectivity
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "❌ RDP port test failed"
+            exit 1
+          }
+          Write-Host "✅ RDP is accessible!"
+
+      - name: 🛡️ Guardian Process (Prevents Disconnection)
+        run: |
+          Write-Host "🛡️ Starting Guardian Process..."
+          
+          # Create watchdog script
+          $watchdogScript = @"
+          while (`$true) {
+              try {
+                  # Check Tailscale status
+                  `$tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+                  
+                  # If disconnected, reconnect
+                  if (`$tsStatus -match "disconnected" -or `$tsStatus -match "stopped") {
+                      Write-Host "⚠️ Tailscale disconnected! Reconnecting..."
+                      & "$env:ProgramFiles\Tailscale\tailscale.exe" logout
+                      Start-Sleep -Seconds 5
+                      & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+                        --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+                        --hostname=rdp-permanent `
+                        --accept-routes=true `
+                        --accept-dns=false
+                      Start-Sleep -Seconds 10
+                  }
+                  
+                  # Check if IP is still valid
+                  `$currentIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                  if (-not `$currentIP) {
+                      Write-Host "⚠️ No IP! Restarting Tailscale..."
+                      Get-Process -Name "tailscaled" -ErrorAction SilentlyContinue | Stop-Process -Force
+                      Start-Sleep -Seconds 5
+                      & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+                        --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+                        --hostname=rdp-permanent
+                  }
+                  
+                  # Keep DNS and network stable
+                  ipconfig /flushdns
+                  
+                  # Check RDP service
+                  `$rdpService = Get-Service -Name "TermService"
+                  if (`$rdpService.Status -ne 'Running') {
+                      Write-Host "⚠️ RDP service stopped! Restarting..."
+                      Start-Service -Name TermService -Force
+                  }
+                  
+              } catch {
+                  Write-Host "⚠️ Guardian error: `$_"
+              }
+              
+              Start-Sleep -Seconds 30
+          }
+"@
+          
+          # Run watchdog in background
+          $watchdogPath = "$env:TEMP\watchdog.ps1"
+          $watchdogScript | Out-File -FilePath $watchdogPath -Encoding ASCII
+          
+          # Start watchdog
+          Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchdogPath`"" -WindowStyle Hidden
+          
+          Write-Host "✅ Guardian process started"
+
+      - name: 🔄 Auto-Reconnect Loop
+        run: |
+          $endTime = (Get-Date).AddHours(${{ github.event.inputs.duration }})
+          $lastStatus = Get-Date
+          $reconnectAttempts = 0
+          
+          while ((Get-Date) -lt $endTime) {
+            try {
+              # Check connection status every minute
+              if ((Get-Date) - $lastStatus -gt [TimeSpan]::FromMinutes(1)) {
+                $remaining = ($endTime - (Get-Date)).ToString('hh\:mm\:ss')
+                
+                # Test Tailscale connectivity
+                $ping = Test-Connection -ComputerName "100.100.100.100" -Count 1 -Quiet
+                $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                
+                if (-not $ping -or -not $ip) {
+                  Write-Host "⚠️ Connection issue detected! Reconnecting..."
+                  $reconnectAttempts++
+                  
+                  # Force reconnect
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" logout
+                  Start-Sleep -Seconds 5
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+                    --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+                    --hostname=rdp-permanent `
+                    --accept-routes=true
+                  Start-Sleep -Seconds 10
+                  
+                  # Get new IP
+                  $newIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                  if ($newIP) {
+                    Write-Host "✅ Reconnected! New IP: $newIP"
+                    echo "TAILSCALE_IP=$newIP" >> $env:GITHUB_ENV
+                  }
+                } else {
+                  Write-Host "⏳ Session active - Remaining: $remaining | Reconnects: $reconnectAttempts"
+                }
+                
+                $lastStatus = Get-Date
+              }
+              
+              # Keep system awake
+              [System.GC]::Collect()
+              
+            } catch {
+              Write-Host "⚠️ Error in main loop: $_"
+            }
+            
+            Start-Sleep -Seconds 30
+          }
+          
+          Write-Host "`n✅ Session completed!"
+
+      - name: 🧹 Cleanup
+        if: always()
+        run: |
+          Write-Host "🧹 Cleaning up..."
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" logout 2>$null
+          Get-Process -Name "tailscale" -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-Process -Name "tailscaled" -ErrorAction SilentlyContinue | Stop-Process -Force
