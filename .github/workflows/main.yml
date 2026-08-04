@@ -27,20 +27,13 @@ jobs:
       - name: Create Windows SSH User
         shell: powershell
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-            Upper   = [char[]](65..90)
-            Lower   = [char[]](97..122)
-            Number  = [char[]](48..57)
-            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          # Disable Password Complexity Checks for Local Account
+          secedit /export /cfg "$env:TEMP\secpol.cfg"
+          (Get-Content "$env:TEMP\secpol.cfg") -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content "$env:TEMP\secpol.cfg"
+          secedit /configure /db "$env:TEMP\secpol.sdb" /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY
           
+          # Fixed Password with strong compliance
+          $password = "Maha@123477"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name "winssh" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "winssh"
@@ -95,7 +88,7 @@ jobs:
           Write-Host "Windows SSH Connection Details:" -ForegroundColor Green
           Write-Host "IP Address: $env:TAILSCALE_IP" -ForegroundColor White
           Write-Host "Username:   winssh" -ForegroundColor White
-          Write-Host "Password:   $env:RDP_PASS" -ForegroundColor White
+          Write-Host "Password:   $env:SSH_PASS" -ForegroundColor White
           Write-Host "Command:    ssh winssh@$env:TAILSCALE_IP" -ForegroundColor Cyan
           Write-Host "==========================================" -ForegroundColor Yellow
 
