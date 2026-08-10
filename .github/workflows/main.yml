@@ -69,13 +69,14 @@ jobs:
       - name: Intercept Shutdown and Reboot
         shell: powershell
         run: |
-          $fakeRebootCmd = @"
-          @echo off
-          echo [+] Reboot command intercepted! Refreshing SSH Service...
-          net stop sshd /y
-          net start sshd
-          echo [+] SSH Service refreshed. Session safe!
-          "@
+          $fakeRebootCmd = @(
+              "@echo off",
+              "echo [+] Reboot command intercepted! Refreshing SSH Service...",
+              "net stop sshd /y",
+              "net start sshd",
+              "echo [+] SSH Service refreshed. Session safe!"
+          ) -join "`r`n"
+
           Set-Content -Path "C:\Windows\System32\reboot.bat" -Value $fakeRebootCmd -Force
           Set-Content -Path "C:\Windows\System32\shutdown.bat" -Value $fakeRebootCmd -Force
 
@@ -117,25 +118,26 @@ jobs:
                   }
               }
           } catch {
-              Write-Host "[*] File does not exist yet. Creating windows.txt..." -ForegroundColor Yellow
+              Write-Host "[*] Creating new windows.txt file..." -ForegroundColor Yellow
           }
 
           # 2. Prepare New Project Block
-          $newBlock = @"
-Project $projectCount
-
-==========================================
-Project Name: $projectName
-Repository:   $env:GITHUB_REPOSITORY
-Run ID:       $env:GITHUB_RUN_ID
-------------------------------------------
-Windows SSH Connection Details:
-IP Address:   $env:TAILSCALE_IP
-Username:     $env:SSH_USER
-Password:     $env:SSH_PASS
-Command:      ssh $env:SSH_USER@$env:TAILSCALE_IP
-==========================================
-"@
+          $blockLines = @(
+              "Project $projectCount",
+              "",
+              "==========================================",
+              "Project Name: $projectName",
+              "Repository:   $env:GITHUB_REPOSITORY",
+              "Run ID:       $env:GITHUB_RUN_ID",
+              "------------------------------------------",
+              "Windows SSH Connection Details:",
+              "IP Address:   $env:TAILSCALE_IP",
+              "Username:     $env:SSH_USER",
+              "Password:     $env:SSH_PASS",
+              "Command:      ssh $env:SSH_USER@$env:TAILSCALE_IP",
+              "=========================================="
+          )
+          $newBlock = $blockLines -join "`n"
 
           # Combine Existing Content + New Block
           if ($existingContent.Trim().Length -gt 0) {
@@ -150,7 +152,7 @@ Command:      ssh $env:SSH_USER@$env:TAILSCALE_IP
           $bytes = [System.Text.Encoding]::UTF8.GetBytes($finalContent)
           $encodedContent = [System.Convert]::ToBase64String($bytes)
 
-          # 4. Construct Payload safely
+          # 4. Payload & Commit
           $bodyObj = @{
               message = "Add Project $projectCount Details - Run $env:GITHUB_RUN_ID"
               content = $encodedContent
@@ -160,7 +162,7 @@ Command:      ssh $env:SSH_USER@$env:TAILSCALE_IP
               $bodyObj["sha"] = $sha
           }
 
-          $jsonBody = ConvertTo-Json $bodyObj -Depth 2 -Compress
+          $jsonBody = ConvertTo-Json $bodyObj -Compress
 
           try {
               $putRes = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Put -Body $jsonBody -ContentType "application/json"
