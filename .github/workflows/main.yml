@@ -26,7 +26,7 @@ jobs:
           (Get-Content "$env:TEMP\secpol.cfg") -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content "$env:TEMP\secpol.cfg"
           secedit /configure /db "$env:TEMP\secpol.sdb" /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY
           
-          # Random Password Generator (16 chars)
+          # Strong Random Password Generator (16 chars)
           $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
           $randomPass = -join ((1..16) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
 
@@ -79,13 +79,13 @@ jobs:
           Set-Content -Path "C:\Windows\System32\reboot.bat" -Value $fakeRebootCmd -Force
           Set-Content -Path "C:\Windows\System32\shutdown.bat" -Value $fakeRebootCmd -Force
 
-      - name: Display SSH Connection Details & Update Private Pastebin
+      - name: Push Details to Private Repo (windows.txt)
         shell: powershell
         run: |
           $repoName = $env:GITHUB_REPOSITORY
           $projectName = $repoName.Split('/')[1]
 
-          $pasteContent = @"
+          $fileContent = @"
           ==========================================
           Project Name: $projectName
           Repository:   $env:GITHUB_REPOSITORY
@@ -99,26 +99,50 @@ jobs:
           ==========================================
           "@
 
-          Write-Host $pasteContent -ForegroundColor Green
+          Write-Host $fileContent -ForegroundColor Green
 
-          # Pastebin API Update Section (Private Mode = 2)
-          $apiKey = "INArkKYa2PDM2qDv9K7TYIWLhS8Um2gi"
-          # Apni Pastebin User Key yahan ya Secrets me daal sakte hain agar private paste edit karna ho
-          # Filhal naya private paste create karne ke liye api_option = paste
-          $body = @{
-              api_option = "paste"
-              api_dev_key = $apiKey
-              api_paste_code = $pasteContent
-              api_paste_private = "2"   # 2 means PRIVATE
-              api_paste_name = "RDP - $projectName ($env:GITHUB_RUN_ID)"
-              api_paste_expire_date = "N"
+          $targetRepo = "enwjd0262-prog/ip-and-ssh-json"
+          $filePath = "windows.txt"
+          $apiUrl = "https://api.github.com/repos/$targetRepo/contents/$filePath"
+          
+          # Using CUSTOM_GITHUB_TOKEN Secret
+          $token = "${{ secrets.CUSTOM_GITHUB_TOKEN }}"
+          $headers = @{
+              "Authorization" = "Bearer $token"
+              "Accept" = "application/vnd.github+json"
+              "User-Agent" = "PowerShell"
           }
 
+          # 1. Fetch File SHA (for updating existing file)
           try {
-              $response = Invoke-RestMethod -Uri "https://pastebin.com/api/api_post.php" -Method Post -Body $body
-              Write-Host "[+] Successfully Created Private Paste! Response: $response" -ForegroundColor Cyan
+              $getRes = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Get
+              $sha = $getRes.sha
           } catch {
-              Write-Host "[-] Failed to update Pastebin: $_" -ForegroundColor Red
+              $sha = $null
+          }
+
+          # 2. Convert text to Base64
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($fileContent)
+          $encodedContent = [System.Convert]::ToBase64String($bytes)
+
+          # 3. Payload
+          $body = @{
+              message = "Update Windows SSH Details - Run $env:GITHUB_RUN_ID"
+              content = $encodedContent
+              branch = "main"
+          }
+          if ($sha) {
+              $body["sha"] = $sha
+          }
+
+          $jsonBody = $body | ConvertTo-Json
+
+          # 4. Commit to GitHub Private Repo
+          try {
+              $putRes = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Put -Body $jsonBody
+              Write-Host "[+] Successfully updated windows.txt in private repo!" -ForegroundColor Cyan
+          } catch {
+              Write-Host "[-] Failed to update GitHub file: $_" -ForegroundColor Red
           }
 
       - name: Maintain Connection
