@@ -41,13 +41,11 @@ jobs:
       - name: Prepare Cloudflare Tunnel with Random Subdomain
         shell: powershell
         run: |
-          # Generate the hostname that is written to windows.txt.
           $randNum = Get-Random -Minimum 10000000 -Maximum 99999999
           $fullDomain = "$randNum.co08.art"
           Write-Host "[+] Generated Random Domain URL: $fullDomain" -ForegroundColor Cyan
           "FULL_DOMAIN=$fullDomain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          # Download cloudflared once; the process is started in the final long-running step.
           $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
           $exePath = "$env:TEMP\cloudflared.exe"
           Invoke-WebRequest -Uri $cfUrl -OutFile $exePath
@@ -74,7 +72,6 @@ jobs:
               "User-Agent"    = "PowerShell"
           }
 
-          # 1. Fetch Existing File Content and SHA
           $existingContent = ""
           $sha = $null
           $projectCount = 1
@@ -88,7 +85,6 @@ jobs:
                   $existingBytes = [System.Convert]::FromBase64String($cleanB64)
                   $existingContent = [System.Text.Encoding]::UTF8.GetString($existingBytes)
 
-                  # Calculate project counter
                   $matches = [regex]::Matches($existingContent, "Project\s+(\d+)")
                   if ($matches.Count -gt 0) {
                       $projectCount = $matches.Count + 1
@@ -98,7 +94,6 @@ jobs:
               Write-Host "[*] Creating new windows.txt file..." -ForegroundColor Yellow
           }
 
-          # 2. Prepare New Project Block with Random Subdomain
           $blockLines = @(
               "Project $projectCount",
               "",
@@ -115,20 +110,17 @@ jobs:
           )
           $newBlock = $blockLines -join "`n"
 
-          # Combine Existing Content + New Block
           if ($existingContent.Trim().Length -gt 0) {
               $finalContent = $existingContent.Trim() + "`n`n" + $newBlock.Trim()
           } else {
               $finalContent = $newBlock.Trim()
           }
 
-          Write-Host "[+] Prepared RDP details for $projectName (credentials are masked)." -ForegroundColor Green
+          Write-Host "[+] Prepared RDP details for $projectName." -ForegroundColor Green
 
-          # 3. Encode to Base64
           $bytes = [System.Text.Encoding]::UTF8.GetBytes($finalContent)
           $encodedContent = [System.Convert]::ToBase64String($bytes)
 
-          # 4. Payload & Commit
           $bodyObj = @{
               message = "Add Project $projectCount Random Subdomain RDP - Run $env:GITHUB_RUN_ID"
               content = $encodedContent
@@ -162,17 +154,7 @@ jobs:
               exit 1
           }
 
-          # Accept a raw connector token or a full cloudflared command pasted into the secret.
-          $tunnelToken = $env:CLOUDFLARE_TUNNEL_TOKEN.Trim()
-          # Accept raw token, --token TOKEN, --token=TOKEN, or a full cloudflared command.
-          if ($tunnelToken -match "(?i)--token(?:=|\s+)(?:['\"]?)([^\s'\"]+)(?:['\"]?)") {
-              $tunnelToken = $matches[1]
-          }
-          $tunnelToken = $tunnelToken.Trim().Trim("'").Trim('"')
-          if ([string]::IsNullOrWhiteSpace($tunnelToken) -or $tunnelToken -match "\s") {
-              Write-Error "CF_TUNNEL_TOKEN is not a raw Cloudflare connector token or a recognized cloudflared command."
-              exit 1
-          }
+          $tunnelToken = $env:CLOUDFLARE_TUNNEL_TOKEN.Trim().Trim("'").Trim('"')
 
           function Start-Tunnel {
               Remove-Item $stderrPath, $stdoutPath -Force -ErrorAction SilentlyContinue
