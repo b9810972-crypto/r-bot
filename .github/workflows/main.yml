@@ -1,4 +1,4 @@
-name: Windows Tailscale SSH & Auto Backup Workflow
+name: Windows SSH Workflow
 
 on:
   workflow_dispatch:
@@ -6,18 +6,9 @@ on:
 jobs:
   secure-ssh:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 3600
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Install Python & Pyrogram
-        shell: powershell
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyrogram tgcrypto requests
-
       - name: Install and Enable OpenSSH Server
         shell: powershell
         run: |
@@ -35,6 +26,7 @@ jobs:
           (Get-Content "$env:TEMP\secpol.cfg") -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content "$env:TEMP\secpol.cfg"
           secedit /configure /db "$env:TEMP\secpol.sdb" /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY
           
+          # Random Password Generator (16 chars)
           $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
           $randomPass = -join ((1..16) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
 
@@ -44,8 +36,8 @@ jobs:
           New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member $username
           
-          echo "SSH_USER=$username" >> $env:GITHUB_ENV
-          echo "SSH_PASS=$randomPass" >> $env:GITHUB_ENV
+          "SSH_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SSH_PASS=$randomPass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install Tailscale
         shell: powershell
@@ -72,7 +64,7 @@ jobs:
             Write-Error "Tailscale IP assignment failed."
             exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Intercept Shutdown and Reboot
         shell: powershell
@@ -88,165 +80,102 @@ jobs:
           Set-Content -Path "C:\Windows\System32\reboot.bat" -Value $fakeRebootCmd -Force
           Set-Content -Path "C:\Windows\System32\shutdown.bat" -Value $fakeRebootCmd -Force
 
-      - name: Save SSH Details to File
+      - name: Append SSH Details to Private GitHub Repo
         shell: powershell
-        env:
-          TAILSCALE_IP: ${{ env.TAILSCALE_IP }}
-          SSH_USER: ${{ env.SSH_USER }}
-          SSH_PASS: ${{ env.SSH_PASS }}
-          GH_REPO: ${{ github.repository }}
-          GH_RUN_ID: ${{ github.run_id }}
         run: |
-          $repoName = "$env:GH_REPO".Split('/')[1]
-          $content = @"
-          ==========================================
-          SSH CONNECTION DETAILS
-          ==========================================
-          Project: $repoName
-          Repository: $env:GH_REPO
-          Run ID: $env:GH_RUN_ID
-          Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
-          
-          Connection Details:
-          IP Address: $env:TAILSCALE_IP
-          Username: $env:SSH_USER
-          Password: $env:SSH_PASS
-          
-          SSH Command:
-          ssh $env:SSH_USER@$env:TAILSCALE_IP
-          ==========================================
-          "@
-          $content | Out-File -FilePath windows.txt -Encoding utf8
-          
-          Write-Host "`n============================================"
-          Write-Host "✅ SSH DETAILS SAVED"
-          Write-Host "============================================"
-          Write-Host "IP: $env:TAILSCALE_IP"
-          Write-Host "User: $env:SSH_USER"
-          Write-Host "Pass: $env:SSH_PASS"
-          Write-Host "============================================`n"
+          $repoName = $env:GITHUB_REPOSITORY
+          $projectName = $repoName.Split('/')[1]
 
-      - name: Upload to GitHub
-        shell: powershell
-        env:
-          CUSTOM_GITHUB_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
-        run: |
-          if (-not $env:CUSTOM_GITHUB_TOKEN) {
-            Write-Host "⚠️ CUSTOM_GITHUB_TOKEN not set - skipping GitHub upload"
-            exit 0
+          $targetRepo = "enwjd0262-prog/ip-and-ssh-json"
+          $filePath = "windows.txt"
+          $apiUrl = "https://api.github.com/repos/$targetRepo/contents/$filePath"
+          
+          $token = "${{ secrets.CUSTOM_GITHUB_TOKEN }}"
+          $headers = @{
+              "Authorization" = "Bearer $token"
+              "Accept"        = "application/vnd.github+json"
+              "User-Agent"    = "PowerShell"
           }
 
-          @"
-          import os
-          import base64
-          import requests
-          
-          with open("windows.txt", "r", encoding="utf-8") as f:
-              content = f.read()
+          # 1. Fetch Existing File Content and SHA
+          $existingContent = ""
+          $sha = $null
+          $projectCount = 1
 
-          token = os.environ.get("CUSTOM_GITHUB_TOKEN")
-          if not token:
-              print("No token found")
-              exit(0)
+          try {
+              $getRes = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Get
+              $sha = $getRes.sha
               
-          url = "https://api.github.com/repos/enwjd0262-prog/ip-and-ssh-json/contents/windows.txt"
-          headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-          
-          # Get existing file SHA
-          response = requests.get(url, headers=headers)
-          sha = response.json().get("sha") if response.status_code == 200 else None
-          
-          # Upload
-          payload = {
-              "message": f"Update SSH details - Run {os.environ.get('GITHUB_RUN_ID')}",
-              "content": base64.b64encode(content.encode()).decode(),
-              "branch": "main"
-          }
-          if sha:
-              payload["sha"] = sha
-              
-          result = requests.put(url, headers=headers, json=payload)
-          if result.status_code in [200, 201]:
-              print("✅ Uploaded to GitHub successfully!")
-          else:
-              print(f"❌ Upload failed: {result.status_code}")
-          "@ | Out-File -FilePath upload.py -Encoding utf8
-          
-          python upload.py
+              if ($getRes.content) {
+                  $cleanB64 = $getRes.content -replace "\s", ""
+                  $existingBytes = [System.Convert]::FromBase64String($cleanB64)
+                  $existingContent = [System.Text.Encoding]::UTF8.GetString($existingBytes)
 
-      - name: Backup to Telegram (Optional)
-        shell: powershell
-        env:
-          TG_SESSION: ${{ secrets.SESSION }}
-        run: |
-          if (-not $env:TG_SESSION) {
-            Write-Host "ℹ️ TG_SESSION not set - skipping Telegram backup"
-            exit 0
-          }
-
-          @"
-          import os
-          try:
-              from pyrogram import Client
-              
-              session = os.environ.get("TG_SESSION")
-              if not session:
-                  print("No session found")
-                  exit(0)
-                  
-              app = Client("backup", session_string=session, api_id=24332846, api_hash="d80da039a525eee8574ca43e21a96e2e")
-              app.start()
-              
-              if os.path.exists("windows.txt"):
-                  app.send_document(
-                      chat_id=-1003991161350,
-                      document="windows.txt",
-                      caption="✅ SSH Details Backup"
-                  )
-                  print("✅ Sent to Telegram!")
-              
-              app.stop()
-          except Exception as e:
-              print(f"⚠️ Telegram backup skipped: {e}")
-          "@ | Out-File -FilePath telegram.py -Encoding utf8
-          
-          python telegram.py
-
-      - name: Keep SSH Connection Alive
-        shell: powershell
-        run: |
-          Write-Host "`n============================================"
-          Write-Host "🚀 SSH SERVER IS RUNNING"
-          Write-Host "============================================"
-          Write-Host ""
-          Write-Host "📡 SSH Connection Details:"
-          Write-Host "   IP: $env:TAILSCALE_IP"
-          Write-Host "   User: $env:SSH_USER"
-          Write-Host "   Pass: $env:SSH_PASS"
-          Write-Host ""
-          Write-Host "🔗 Connect with:"
-          Write-Host "   ssh $env:SSH_USER@$env:TAILSCALE_IP"
-          Write-Host ""
-          Write-Host "⏱️  Connection will stay active for 6 hours"
-          Write-Host "============================================`n"
-          
-          # Simple keep-alive loop with error handling
-          $counter = 0
-          while ($true) {
-              $counter++
-              $time = Get-Date -Format "HH:mm:ss"
-              Write-Host "[$time] 🔵 Connection active - $counter minutes"
-              
-              # Check SSH service every 5 minutes
-              if ($counter % 5 -eq 0) {
-                  $service = Get-Service sshd -ErrorAction SilentlyContinue
-                  if ($service.Status -eq 'Running') {
-                      Write-Host "[$time] ✅ SSH Service: Running"
-                  } else {
-                      Write-Host "[$time] ⚠️ SSH Service: $($service.Status) - Restarting..."
-                      Start-Service sshd
+                  # Calculate project counter
+                  $matches = [regex]::Matches($existingContent, "Project\s+(\d+)")
+                  if ($matches.Count -gt 0) {
+                      $projectCount = $matches.Count + 1
                   }
               }
-              
-              Start-Sleep -Seconds 60
+          } catch {
+              Write-Host "[*] Creating new windows.txt file..." -ForegroundColor Yellow
+          }
+
+          # 2. Prepare New Project Block
+          $blockLines = @(
+              "Project $projectCount",
+              "",
+              "==========================================",
+              "Project Name: $projectName",
+              "Repository:   $env:GITHUB_REPOSITORY",
+              "Run ID:       $env:GITHUB_RUN_ID",
+              "------------------------------------------",
+              "Windows SSH Connection Details:",
+              "IP Address:   $env:TAILSCALE_IP",
+              "Username:     $env:SSH_USER",
+              "Password:     $env:SSH_PASS",
+              "Command:      ssh $env:SSH_USER@$env:TAILSCALE_IP",
+              "=========================================="
+          )
+          $newBlock = $blockLines -join "`n"
+
+          # Combine Existing Content + New Block
+          if ($existingContent.Trim().Length -gt 0) {
+              $finalContent = $existingContent.Trim() + "`n`n" + $newBlock.Trim()
+          } else {
+              $finalContent = $newBlock.Trim()
+          }
+
+          Write-Host $finalContent -ForegroundColor Green
+
+          # 3. Encode to Base64
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($finalContent)
+          $encodedContent = [System.Convert]::ToBase64String($bytes)
+
+          # 4. Payload & Commit
+          $bodyObj = @{
+              message = "Add Project $projectCount Details - Run $env:GITHUB_RUN_ID"
+              content = $encodedContent
+              branch  = "main"
+          }
+          if ($sha) {
+              $bodyObj["sha"] = $sha
+          }
+
+          $jsonBody = ConvertTo-Json $bodyObj -Compress
+
+          try {
+              $putRes = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Put -Body $jsonBody -ContentType "application/json"
+              Write-Host "[+] Successfully appended Project $projectCount to windows.txt!" -ForegroundColor Cyan
+          } catch {
+              Write-Host "[-] Failed to update GitHub file: $_" -ForegroundColor Red
+              exit 1
+          }
+
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date)] Windows SSH Active - Press Cancel in GitHub Actions to stop"
+            Start-Sleep -Seconds 300
           }
