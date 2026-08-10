@@ -39,25 +39,27 @@ jobs:
           "SSH_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "SSH_PASS=$randomPass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Establish Pinggy SSH Tunnel
+      - name: Setup Cloudflare Tunnel
         shell: powershell
         run: |
-          $logPath = "$env:TEMP\pinggy.log"
-          
-          # Pinggy TCP Tunnel Start
-          Start-Process ssh -ArgumentList "-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -R 0:localhost:22 a.pinggy.io" -RedirectStandardOutput $logPath -RedirectStandardError "$env:TEMP\pinggy_err.log"
+          # 1. Download Cloudflare Tunnel Executable
+          $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          $exePath = "$env:TEMP\cloudflared.exe"
+          Invoke-WebRequest -Uri $cfUrl -OutFile $exePath
+
+          # 2. Start Cloudflare Tunnel for SSH (Port 22)
+          $logPath = "$env:TEMP\cloudflared.log"
+          Start-Process $exePath -ArgumentList "tunnel --url ssh://localhost:22" -RedirectStandardError $logPath -RedirectStandardOutput "$env:TEMP\cf_out.log"
 
           $tunnelUrl = ""
           $retries = 0
 
-          # Log Fetch Loop (~60 Seconds)
-          while (-not $tunnelUrl -and $retries -lt 20) {
+          # 3. Fetch Generated Subdomain (~60 Seconds)
+          while (-not $tunnelUrl -and $retries -lt 30) {
               Start-Sleep -Seconds 3
               if (Test-Path $logPath) {
                   $logContent = Get-Content $logPath -Raw -ErrorAction SilentlyContinue
-                  if ($logContent -match "tcp://([a-zA-0\.-]+:\d+)") {
-                      $tunnelUrl = $matches[1]
-                  } elseif ($logContent -match "([a-zA-0\.-]+\.pinggy\.link:\d+)") {
+                  if ($logContent -match "(https://[a-zA-0\.-]+\.trycloudflare\.com)") {
                       $tunnelUrl = $matches[1]
                   }
               }
@@ -66,21 +68,17 @@ jobs:
 
           if (-not $tunnelUrl) {
               Write-Host "=== ERROR LOGS ===" -ForegroundColor Red
-              if (Test-Path "$env:TEMP\pinggy_err.log") { Get-Content "$env:TEMP\pinggy_err.log" }
               if (Test-Path $logPath) { Get-Content $logPath }
-              Write-Error "Pinggy tunnel assignment failed."
+              Write-Error "Cloudflare tunnel assignment failed."
               exit 1
           }
 
-          $splitAddr = $tunnelUrl.Split(':')
-          $domain = $splitAddr[0]
-          $port = $splitAddr[1]
+          $cleanDomain = $tunnelUrl -replace "https://", ""
 
-          Write-Host "[+] Tunnel Created Successfully: $tunnelUrl" -ForegroundColor Green
+          Write-Host "[+] Cloudflare Tunnel Created: $tunnelUrl" -ForegroundColor Green
 
           "PUBLIC_URL=$tunnelUrl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "SSH_DOMAIN=$domain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "SSH_PORT=$port" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SSH_DOMAIN=$cleanDomain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Intercept Shutdown and Reboot
         shell: powershell
@@ -150,7 +148,7 @@ jobs:
               "Public URL:   $env:PUBLIC_URL",
               "Username:     $env:SSH_USER",
               "Password:     $env:SSH_PASS",
-              "Command:      ssh -p $env:SSH_PORT $env:SSH_USER@$env:SSH_DOMAIN",
+              "Connect Command: ssh -o ProxyCommand=`"cloudflared access ssh --hostname %h`" $env:SSH_USER@$env:SSH_DOMAIN",
               "=========================================="
           )
           $newBlock = $blockLines -join "`n"
