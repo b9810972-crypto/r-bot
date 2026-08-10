@@ -1,4 +1,4 @@
-name: Windows SSH Workflow
+Name: Windows SSH Workflow
 
 on:
   workflow_dispatch:
@@ -26,7 +26,7 @@ jobs:
           (Get-Content "$env:TEMP\secpol.cfg") -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content "$env:TEMP\secpol.cfg"
           secedit /configure /db "$env:TEMP\secpol.sdb" /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY
           
-          # Strong Random Password Generator (16 chars)
+          # Random Password Generator (16 chars)
           $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
           $randomPass = -join ((1..16) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
 
@@ -79,57 +79,83 @@ jobs:
           Set-Content -Path "C:\Windows\System32\reboot.bat" -Value $fakeRebootCmd -Force
           Set-Content -Path "C:\Windows\System32\shutdown.bat" -Value $fakeRebootCmd -Force
 
-      - name: Push Details to Private Repo (windows.txt)
+      - name: Append SSH Details to Private GitHub Repo
         shell: powershell
         run: |
           $repoName = $env:GITHUB_REPOSITORY
           $projectName = $repoName.Split('/')[1]
 
-          $fileContent = @"
-          ==========================================
-          Project Name: $projectName
-          Repository:   $env:GITHUB_REPOSITORY
-          Run ID:       $env:GITHUB_RUN_ID
-          ------------------------------------------
-          Windows SSH Connection Details:
-          IP Address:   $env:TAILSCALE_IP
-          Username:     $env:SSH_USER
-          Password:     $env:SSH_PASS
-          Command:      ssh $env:SSH_USER@$env:TAILSCALE_IP
-          ==========================================
-          "@
-
-          Write-Host $fileContent -ForegroundColor Green
-
           $targetRepo = "enwjd0262-prog/ip-and-ssh-json"
           $filePath = "windows.txt"
           $apiUrl = "https://api.github.com/repos/$targetRepo/contents/$filePath"
           
-          # Using CUSTOM_GITHUB_TOKEN Secret
           $token = "${{ secrets.CUSTOM_GITHUB_TOKEN }}"
           $headers = @{
               "Authorization" = "Bearer $token"
-              "Accept" = "application/vnd.github+json"
-              "User-Agent" = "PowerShell"
+              "Accept"        = "application/vnd.github+json"
+              "User-Agent"    = "PowerShell"
           }
 
-          # 1. Fetch File SHA (for updating existing file)
+          # 1. Fetch Existing File Content and SHA
+          $existingContent = ""
+          $sha = $null
+          $projectCount = 1
+
           try {
               $getRes = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Get
               $sha = $getRes.sha
+              
+              if ($getRes.content) {
+                  $cleanB64 = $getRes.content -replace "`n", "" -replace "`r", ""
+                  $existingBytes = [System.Convert]::FromBase64String($cleanB64)
+                  $existingContent = [System.Text.Encoding]::UTF8.GetString($existingBytes)
+
+                  # Calculate project counter based on existing entries
+                  $matches = [regex]::Matches($existingContent, "Project\s+(\d+)")
+                  if ($matches.Count -gt 0) {
+                      $projectCount = $matches.Count + 1
+                  }
+              }
           } catch {
-              $sha = $null
+              Write-Host "[*] File does not exist yet. Creating windows.txt..." -ForegroundColor Yellow
           }
 
-          # 2. Convert text to Base64
-          $bytes = [System.Text.Encoding]::UTF8.GetBytes($fileContent)
+          # 2. Prepare New Project Block
+          $newBlock = @"
+
+Project $projectCount
+
+==========================================
+Project Name: $projectName
+Repository:   $env:GITHUB_REPOSITORY
+Run ID:       $env:GITHUB_RUN_ID
+------------------------------------------
+Windows SSH Connection Details:
+IP Address:   $env:TAILSCALE_IP
+Username:     $env:SSH_USER
+Password:     $env:SSH_PASS
+Command:      ssh $env:SSH_USER@$env:TAILSCALE_IP
+==========================================
+"@
+
+          # Combine Existing Content + New Block
+          if ($existingContent.Trim().Length -gt 0) {
+              $finalContent = $existingContent.Trim() + "`n`n" + $newBlock.Trim()
+          } else {
+              $finalContent = $newBlock.Trim()
+          }
+
+          Write-Host $finalContent -ForegroundColor Green
+
+          # 3. Encode to Base64
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($finalContent)
           $encodedContent = [System.Convert]::ToBase64String($bytes)
 
-          # 3. Payload
+          # 4. Payload & Commit
           $body = @{
-              message = "Update Windows SSH Details - Run $env:GITHUB_RUN_ID"
+              message = "Add Project $projectCount Details - Run $env:GITHUB_RUN_ID"
               content = $encodedContent
-              branch = "main"
+              branch  = "main"
           }
           if ($sha) {
               $body["sha"] = $sha
@@ -137,10 +163,9 @@ jobs:
 
           $jsonBody = $body | ConvertTo-Json
 
-          # 4. Commit to GitHub Private Repo
           try {
               $putRes = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Put -Body $jsonBody
-              Write-Host "[+] Successfully updated windows.txt in private repo!" -ForegroundColor Cyan
+              Write-Host "[+] Successfully appended Project $projectCount to windows.txt!" -ForegroundColor Cyan
           } catch {
               Write-Host "[-] Failed to update GitHub file: $_" -ForegroundColor Red
           }
