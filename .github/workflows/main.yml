@@ -39,46 +39,40 @@ jobs:
           "SSH_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "SSH_PASS=$randomPass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Setup Cloudflare Tunnel
+      - name: Establish Serveo SSH Tunnel
         shell: powershell
         run: |
-          # 1. Download Cloudflare Tunnel Executable
-          $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          $exePath = "$env:TEMP\cloudflared.exe"
-          Invoke-WebRequest -Uri $cfUrl -OutFile $exePath
+          $logPath = "$env:TEMP\serveo.log"
+          
+          # 1. Start Serveo Tunnel in Background
+          Start-Process ssh -ArgumentList "-tt -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -R 0:localhost:22 serveo.net" -RedirectStandardOutput $logPath -RedirectStandardError "$env:TEMP\serveo_err.log"
 
-          # 2. Start Cloudflare Tunnel for SSH (Port 22)
-          $logPath = "$env:TEMP\cloudflared.log"
-          Start-Process $exePath -ArgumentList "tunnel --url ssh://localhost:22" -RedirectStandardError $logPath -RedirectStandardOutput "$env:TEMP\cf_out.log"
-
-          $tunnelUrl = ""
+          $tunnelPort = ""
           $retries = 0
 
-          # 3. Fetch Generated Subdomain (~60 Seconds)
-          while (-not $tunnelUrl -and $retries -lt 30) {
+          # 2. Fetch Assigned Port (~60 Seconds)
+          while (-not $tunnelPort -and $retries -lt 30) {
               Start-Sleep -Seconds 3
               if (Test-Path $logPath) {
                   $logContent = Get-Content $logPath -Raw -ErrorAction SilentlyContinue
-                  if ($logContent -match "(https://[a-zA-Z0-9\.-]+\.trycloudflare\.com)") {
-                      $tunnelUrl = $matches[1]
+                  if ($logContent -match "Forwarding SSH traffic from serveo\.net:(\d+)") {
+                      $tunnelPort = $matches[1]
                   }
               }
               $retries++
           }
 
-          if (-not $tunnelUrl) {
+          if (-not $tunnelPort) {
               Write-Host "=== ERROR LOGS ===" -ForegroundColor Red
               if (Test-Path $logPath) { Get-Content $logPath }
-              Write-Error "Cloudflare tunnel assignment failed."
+              Write-Error "Serveo tunnel assignment failed."
               exit 1
           }
 
-          $cleanDomain = $tunnelUrl -replace "https://", ""
+          Write-Host "[+] Serveo SSH Tunnel Created on Port: $tunnelPort" -ForegroundColor Green
 
-          Write-Host "[+] Cloudflare Tunnel Created: $tunnelUrl" -ForegroundColor Green
-
-          "PUBLIC_URL=$tunnelUrl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "SSH_DOMAIN=$cleanDomain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SSH_HOST=serveo.net" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SSH_PORT=$tunnelPort" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Intercept Shutdown and Reboot
         shell: powershell
@@ -145,10 +139,11 @@ jobs:
               "Run ID:       $env:GITHUB_RUN_ID",
               "------------------------------------------",
               "Windows SSH Connection Details:",
-              "Public URL:   $env:PUBLIC_URL",
+              "Host:         $env:SSH_HOST",
+              "Port:         $env:SSH_PORT",
               "Username:     $env:SSH_USER",
               "Password:     $env:SSH_PASS",
-              "Connect Command: ssh -o ProxyCommand=`"cloudflared access ssh --hostname %h`" $env:SSH_USER@$env:SSH_DOMAIN",
+              "Connect Command: ssh -p $env:SSH_PORT $env:SSH_USER@$env:SSH_HOST",
               "=========================================="
           )
           $newBlock = $blockLines -join "`n"
