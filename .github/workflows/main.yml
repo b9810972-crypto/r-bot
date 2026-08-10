@@ -36,7 +36,7 @@ jobs:
           secedit /configure /db "$env:TEMP\secpol.sdb" /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY
           
           $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
-          $randomPass = -join ((1..16) | ForEach-Object { $chars[(Get-Medical -Maximum $chars.Length) rescue (Get-Random -Maximum $chars.Length)] })
+          $randomPass = -join ((1..16) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
 
           $username = "R-BOT"
           $securePass = ConvertTo-SecureString $randomPass -AsPlainText -Force
@@ -44,8 +44,8 @@ jobs:
           New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member $username
           
-          "SSH_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "SSH_PASS=$randomPass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "SSH_USER=$username" >> $env:GITHUB_ENV
+          echo "SSH_PASS=$randomPass" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         shell: powershell
@@ -72,7 +72,7 @@ jobs:
             Write-Error "Tailscale IP assignment failed."
             exit 1
           }
-          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
       - name: Intercept Shutdown and Reboot
         shell: powershell
@@ -88,180 +88,166 @@ jobs:
           Set-Content -Path "C:\Windows\System32\reboot.bat" -Value $fakeRebootCmd -Force
           Set-Content -Path "C:\Windows\System32\shutdown.bat" -Value $fakeRebootCmd -Force
 
-      - name: Backup & Sync via GitHub API and Telegram
+      - name: Save SSH Details to File
         shell: powershell
         env:
-          TG_SESSION: ${{ secrets.SESSION }}
-          CUSTOM_GITHUB_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
           TAILSCALE_IP: ${{ env.TAILSCALE_IP }}
           SSH_USER: ${{ env.SSH_USER }}
           SSH_PASS: ${{ env.SSH_PASS }}
           GH_REPO: ${{ github.repository }}
           GH_RUN_ID: ${{ github.run_id }}
         run: |
-          $script = @'
+          $repoName = "$env:GH_REPO".Split('/')[1]
+          $content = @"
+          Project 1
+          ==========================================
+          Project Name: $repoName
+          Repository:   $env:GH_REPO
+          Run ID:       $env:GH_RUN_ID
+          ------------------------------------------
+          Windows SSH Connection Details:
+          IP Address:   $env:TAILSCALE_IP
+          Username:     $env:SSH_USER
+          Password:     $env:SSH_PASS
+          Command:      ssh $env:SSH_USER@$env:TAILSCALE_IP
+          ==========================================
+          "@
+          $content | Out-File -FilePath windows.txt -Encoding utf8
+          
+          # Also save as output for display
+          Write-Host "SSH Connection Details:"
+          Write-Host "IP: $env:TAILSCALE_IP"
+          Write-Host "User: $env:SSH_USER"
+          Write-Host "Pass: $env:SSH_PASS"
+
+      - name: Upload SSH Details to GitHub
+        shell: powershell
+        env:
+          CUSTOM_GITHUB_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
+        run: |
+          if (-not $env:CUSTOM_GITHUB_TOKEN) {
+            Write-Host "⚠️ CUSTOM_GITHUB_TOKEN not set! Skipping GitHub upload."
+            exit 0
+          }
+
+          @"
           import os
           import base64
-          import re
           import requests
+
+          # Read the file content
+          with open("windows.txt", "r", encoding="utf-8") as f:
+              content = f.read()
 
           target_repo = "enwjd0262-prog/ip-and-ssh-json"
           file_path = "windows.txt"
           github_token = os.environ.get("CUSTOM_GITHUB_TOKEN")
-          
+          api_url = f"https://api.github.com/repos/{target_repo}/contents/{file_path}"
+
           headers = {
-              "Authorization": "Bearer " + str(github_token),
-              "Accept": "application/vnd.github+json",
-              "User-Agent": "PythonScript"
+              "Authorization": f"token {github_token}",
+              "Accept": "application/vnd.github.v3+json"
           }
-          api_url = "https://api.github.com/repos/" + target_repo + "/contents/" + file_path
 
-          restored_content = ""
-
-          # Try Telegram Restore first if session exists
-          session_string = os.environ.get("TG_SESSION")
-          if session_string:
-              try:
-                  from pyrogram import Client
-                  api_id = 24332846
-                  api_hash = "d80da039a525eee8574ca43e21a96e2e"
-                  channel_id = -1003991161350
-                  app = Client("restore_session", session_string=session_string, api_id=api_id, api_hash=api_hash)
-                  with app:
-                      messages = app.get_chat_history(channel_id, limit=5)
-                      for msg in messages:
-                          if msg.document and msg.document.file_name == "windows.txt":
-                              file_path_local = app.download_media(msg)
-                              if file_path_local:
-                                  with open(file_path_local, "r", encoding="utf-8") as f:
-                                      restored_content = f.read()
-                                  print("[+] Restored database from Telegram!")
-                                  break
-              except Exception as e:
-                  print("[*] Telegram restore skipped/failed: " + str(e))
-
-          # Fallback to GitHub repo file
-          if not restored_content and github_token:
-              try:
-                  res = requests.get(api_url, headers=headers)
-                  if res.status_code == 200:
-                      data = res.json()
-                      restored_content = base64.b64decode(data["content"]).decode("utf-8")
-                      print("[+] Restored database from GitHub repository!")
-              except Exception as e:
-                  print("[*] GitHub fetch error: " + str(e))
-
-          project_count = 1
-          matches = re.findall(r"Project\s+(\d+)", restored_content)
-          if matches:
-              project_count = int(matches[-1]) + 1
-
-          repo_name = os.environ.get("GH_REPO")
-          project_name = repo_name.split('/')[1] if repo_name else "unknown"
-          run_id = os.environ.get("GH_RUN_ID")
-          tailscale_ip = os.environ.get("TAILSCALE_IP")
-          ssh_user = os.environ.get("SSH_USER")
-          ssh_pass = os.environ.get("SSH_PASS")
-
-          new_block = """Project {proj_cnt}
-
-==========================================
-Project Name: {p_name}
-Repository:   {r_name}
-Run ID:       {r_id}
-------------------------------------------
-Windows SSH Connection Details:
-IP Address:   {t_ip}
-Username:     {s_user}
-Password:     {s_pass}
-Command:      ssh {s_user}@{t_ip}
-==========================================""".format(
-              proj_cnt=project_count,
-              p_name=project_name,
-              r_name=repo_name,
-              r_id=run_id,
-              t_ip=tailscale_ip,
-              s_user=ssh_user,
-              s_pass=ssh_pass
-          )
-
-          if restored_content.strip():
-              final_content = restored_content.strip() + "\n\n" + new_block.strip()
+          # Check if file exists
+          get_response = requests.get(api_url, headers=headers)
+          sha = None
+          if get_response.status_code == 200:
+              sha = get_response.json().get("sha")
+              print("[+] Existing file found. Will update.")
           else:
-              final_content = new_block.strip()
+              print("[+] No existing file. Will create new.")
 
-          with open("windows.txt", "w", encoding="utf-8") as f:
-              f.write(final_content)
+          # Prepare for upload
+          encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+          payload = {
+              "message": f"Update Windows SSH details - Run {os.environ.get('GITHUB_RUN_ID')}",
+              "content": encoded,
+              "branch": "main"
+          }
+          if sha:
+              payload["sha"] = sha
 
-          if github_token:
-              try:
-                  get_sha_res = requests.get(api_url, headers=headers)
-                  sha = get_sha_res.json().get("sha") if get_sha_res.status_code == 200 else None
+          # Upload
+          response = requests.put(api_url, headers=headers, json=payload)
+          if response.status_code in [200, 201]:
+              print("[+] Successfully uploaded to GitHub!")
+          else:
+              print(f"[-] Upload failed: {response.status_code}")
+              print(f"[-] Response: {response.text}")
+          "@ | Out-File -FilePath upload.py -Encoding utf8
+          
+          python upload.py
 
-                  encoded_content = base64.b64encode(final_content.encode("utf-8")).decode("utf-8")
-                  payload = {
-                      "message": "Add Project " + str(project_count) + " Details - Run " + str(run_id),
-                      "content": encoded_content,
-                      "branch": "main"
-                  }
-                  if sha:
-                      payload["sha"] = sha
-
-                  put_res = requests.put(api_url, headers=headers, json=payload)
-                  if put_res.status_code in [200, 201]:
-                      print("[+] Successfully updated GitHub file for Project " + str(project_count) + "!")
-                  else:
-                      print("[-] Failed to update GitHub file: " + put_res.text)
-              except Exception as e:
-                  print("[-] GitHub update failed: " + str(e))
-          '@
-          Set-Content -Path "run_sync.py" -Value $script -Encoding utf8
-          python run_sync.py
-
-      - name: Maintain Connection & Auto Backup Every 1 Minute
+      - name: Backup to Telegram (Optional)
         shell: powershell
         env:
           TG_SESSION: ${{ secrets.SESSION }}
         run: |
-          $loopScript = @'
+          if (-not $env:TG_SESSION) {
+            Write-Host "ℹ️ TG_SESSION not set - skipping Telegram backup"
+            exit 0
+          }
+
+          @"
           import os
           import time
-          import sys
-
-          session_string = os.environ.get("TG_SESSION")
-          if not session_string:
-              print("[*] No Telegram session provided. Maintaining SSH connection only...")
-              while True:
-                  time.sleep(60)
-                  print("[+] SSH connection active...")
-
+          
           try:
               from pyrogram import Client
+              
               api_id = 24332846
               api_hash = "d80da039a525eee8574ca43e21a96e2e"
+              session_string = os.environ.get("TG_SESSION")
               channel_id = -1003991161350
 
-              app = Client("my_session_loop", session_string=session_string, api_id=api_id, api_hash=api_hash)
+              app = Client("backup", session_string=session_string, api_id=api_id, api_hash=api_hash)
               app.start()
-              print("[+] Background Telegram Auto-Backup loop started (Every 1 minute)...")
               
-              while True:
-                  time.sleep(60)
-                  if os.path.exists("windows.txt"):
-                      try:
-                          app.send_document(
-                              chat_id=channel_id,
-                              document="windows.txt",
-                              caption="🔄 Automated Database Backup"
-                          )
-                          print("[+] Backup sent to Telegram channel successfully!")
-                      except Exception as e:
-                          print("[-] Telegram backup error: " + str(e))
+              # Send backup
+              if os.path.exists("windows.txt"):
+                  app.send_document(
+                      chat_id=channel_id,
+                      document="windows.txt",
+                      caption="✅ SSH Details Backup"
+                  )
+                  print("[+] Backup sent to Telegram!")
+              
+              app.stop()
+              
           except Exception as e:
-              print("[-] Telegram loop failed: " + str(e) + ". Maintaining SSH connection...")
-              while True:
-                  time.sleep(60)
-                  print("[+] SSH connection active (Fallback mode)...")
-          '@
-          Set-Content -Path "run_loop.py" -Value $loopScript -Encoding utf8
-          python run_loop.py
+              print(f"[-] Telegram backup failed: {e}")
+              print("[*] This is optional - SSH is still running!")
+          "@ | Out-File -FilePath telegram_backup.py -Encoding utf8
+          
+          python telegram_backup.py
+
+      - name: Maintain SSH Connection
+        shell: powershell
+        run: |
+          Write-Host "============================================"
+          Write-Host "✅ SSH SERVER IS RUNNING AND ACCESSIBLE"
+          Write-Host "============================================"
+          Write-Host ""
+          Write-Host "SSH Connection Details:"
+          Write-Host "IP Address: $env:TAILSCALE_IP"
+          Write-Host "Username:   $env:SSH_USER"
+          Write-Host "Password:   $env:SSH_PASS"
+          Write-Host ""
+          Write-Host "Command to connect:"
+          Write-Host "ssh $env:SSH_USER@$env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host ""
+          Write-Host "🔄 Keeping connection alive for 60 minutes..."
+          Write-Host "Press Ctrl+C to stop (but this will close SSH access)"
+          Write-Host ""
+          
+          # Keep the runner alive
+          $endTime = (Get-Date).AddMinutes(60)
+          while ((Get-Date) -lt $endTime) {
+              Write-Host "🟢 Connection active - $(Get-Date -Format 'HH:mm:ss') - Remaining: $([math]::Round(($endTime - (Get-Date)).TotalMinutes)) minutes"
+              Start-Sleep -Seconds 60
+          }
+          
+          Write-Host "⏰ Time's up! Workflow will complete."
