@@ -164,10 +164,13 @@ jobs:
 
           # Accept a raw connector token or a full cloudflared command pasted into the secret.
           $tunnelToken = $env:CLOUDFLARE_TUNNEL_TOKEN.Trim()
-          if ($tunnelToken -match "(?i)--token\s+([^\s]+)") { $tunnelToken = $matches[1] }
+          # Accept raw token, --token TOKEN, --token=TOKEN, or a full cloudflared command.
+          if ($tunnelToken -match "(?i)--token(?:=|\s+)(?:['\"]?)([^\s'\"]+)(?:['\"]?)") {
+              $tunnelToken = $matches[1]
+          }
           $tunnelToken = $tunnelToken.Trim().Trim("'").Trim('"')
-          if ([string]::IsNullOrWhiteSpace($tunnelToken)) {
-              Write-Error "CF_TUNNEL_TOKEN is empty after parsing."
+          if ([string]::IsNullOrWhiteSpace($tunnelToken) -or $tunnelToken -match "\s") {
+              Write-Error "CF_TUNNEL_TOKEN is not a raw Cloudflare connector token or a recognized cloudflared command."
               exit 1
           }
 
