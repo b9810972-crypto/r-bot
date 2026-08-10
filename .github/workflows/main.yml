@@ -81,16 +81,41 @@ jobs:
           Set-Content -Path "C:\Windows\System32\reboot.bat" -Value $fakeRebootCmd -Force
           Set-Content -Path "C:\Windows\System32\shutdown.bat" -Value $fakeRebootCmd -Force
 
-      - name: Display SSH Connection Details
+      - name: Display SSH Connection Details & Update Pastebin
         shell: powershell
         run: |
-          Write-Host "==========================================" -ForegroundColor Yellow
-          Write-Host "Windows SSH Connection Details:" -ForegroundColor Green
-          Write-Host "IP Address: $env:TAILSCALE_IP" -ForegroundColor White
-          Write-Host "Username:   winssh" -ForegroundColor White
-          Write-Host "Password:   $env:SSH_PASS" -ForegroundColor White
-          Write-Host "Command:    ssh winssh@$env:TAILSCALE_IP" -ForegroundColor Cyan
-          Write-Host "==========================================" -ForegroundColor Yellow
+          $pasteContent = @"
+          ==========================================
+          Windows SSH Connection Details:
+          Run ID:     $env:GITHUB_RUN_ID
+          IP Address: $env:TAILSCALE_IP
+          Username:   winssh
+          Password:   $env:SSH_PASS
+          Command:    ssh winssh@$env:TAILSCALE_IP
+          ==========================================
+          "@
+
+          Write-Host $pasteContent -ForegroundColor Green
+
+          # Pastebin API Update Section
+          $apiKey = "INArkKYa2PDM2qDv9K7TYIWLhS8Um2gi"
+          $pasteKey = "0N7UrmvL" # Extracted from https://pastebin.com/raw/0N7UrmvL
+
+          $body = @{
+              api_option = "paste"
+              api_dev_key = $apiKey
+              api_paste_code = $pasteContent
+              api_paste_private = "0"
+              api_paste_name = "RDP Connection Info - Run $env:GITHUB_RUN_ID"
+              api_paste_expire_date = "N"
+          }
+
+          try {
+              $response = Invoke-RestMethod -Uri "https://pastebin.com/api/api_post.php" -Method Post -Body $body
+              Write-Host "[+] Successfully Updated Pastebin! Link: $response" -ForegroundColor Cyan
+          } catch {
+              Write-Host "[-] Failed to update Pastebin: $_" -ForegroundColor Red
+          }
 
       - name: Maintain Connection
         shell: powershell
