@@ -29,6 +29,7 @@ jobs:
 
           $username = "R-BOT"
           $securePass = ConvertTo-SecureString $randomPass -AsPlainText -Force
+          Write-Output "::add-mask::$randomPass"
 
           New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member $username
@@ -37,26 +38,24 @@ jobs:
           "RDP_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "RDP_PASS=$randomPass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Setup Cloudflare Tunnel with Random Subdomain
+      - name: Prepare Cloudflare Tunnel with Random Subdomain
         shell: powershell
         run: |
-          # 1. Generate Random Number Subdomain (e.g., 48291038.co08.art)
+          # Generate the hostname that is written to windows.txt.
           $randNum = Get-Random -Minimum 10000000 -Maximum 99999999
           $fullDomain = "$randNum.co08.art"
-          
           Write-Host "[+] Generated Random Domain URL: $fullDomain" -ForegroundColor Cyan
           "FULL_DOMAIN=$fullDomain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          # 2. Download Cloudflare Tunnel Executable
+          # Download cloudflared once; the process is started in the final long-running step.
           $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
           $exePath = "$env:TEMP\cloudflared.exe"
           Invoke-WebRequest -Uri $cfUrl -OutFile $exePath
-
-          # 3. Run Tunnel using your Cloudflare Tunnel Token from Secrets
-          $tunnelToken = "${{ secrets.CF_TUNNEL_TOKEN }}"
-          Start-Process $exePath -ArgumentList "tunnel run --token $tunnelToken"
-
-          Write-Host "[+] Cloudflare Tunnel Started Successfully!" -ForegroundColor Green
+          if (!(Test-Path $exePath)) {
+              Write-Error "cloudflared download failed."
+              exit 1
+          }
+          "CLOUDFLARED_PATH=$exePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Append Custom Domain RDP Details to Private GitHub Repo
         shell: powershell
@@ -123,7 +122,7 @@ jobs:
               $finalContent = $newBlock.Trim()
           }
 
-          Write-Host $finalContent -ForegroundColor Green
+          Write-Host "[+] Prepared RDP details for $projectName (credentials are masked)." -ForegroundColor Green
 
           # 3. Encode to Base64
           $bytes = [System.Text.Encoding]::UTF8.GetBytes($finalContent)
@@ -149,10 +148,67 @@ jobs:
               exit 1
           }
 
-      - name: Keep Alive
+      - name: Keep Cloudflare Tunnel Alive
         shell: powershell
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          while ($true) {
-            Write-Host "[$(Get-Date)] Windows RDP Active - Press Cancel in GitHub Actions to stop"
-            Start-Sleep -Seconds 300
+          $exePath = if ($env:CLOUDFLARED_PATH) { $env:CLOUDFLARED_PATH } else { "$env:TEMP\cloudflared.exe" }
+          $stderrPath = "$env:TEMP\cloudflared-live.log"
+          $stdoutPath = "$env:TEMP\cloudflared-live-out.log"
+
+          if ([string]::IsNullOrWhiteSpace($env:CLOUDFLARE_TUNNEL_TOKEN)) {
+              Write-Error "CF_TUNNEL_TOKEN GitHub secret is not configured."
+              exit 1
+          }
+
+          # Accept a raw connector token or a full cloudflared command pasted into the secret.
+          $tunnelToken = $env:CLOUDFLARE_TUNNEL_TOKEN.Trim()
+          if ($tunnelToken -match "(?i)--token\s+([^\s]+)") { $tunnelToken = $matches[1] }
+          $tunnelToken = $tunnelToken.Trim().Trim("'").Trim('"')
+          if ([string]::IsNullOrWhiteSpace($tunnelToken)) {
+              Write-Error "CF_TUNNEL_TOKEN is empty after parsing."
+              exit 1
+          }
+
+          function Start-Tunnel {
+              Remove-Item $stderrPath, $stdoutPath -Force -ErrorAction SilentlyContinue
+              $process = Start-Process $exePath -ArgumentList @(
+                  "tunnel", "--no-autoupdate", "run", ("--token=" + $tunnelToken)
+              ) -RedirectStandardError $stderrPath -RedirectStandardOutput $stdoutPath -PassThru
+              Start-Sleep -Seconds 8
+              $process.Refresh()
+              if ($process.HasExited) {
+                  Write-Host "=== CLOUDFLARED ERROR ===" -ForegroundColor Red
+                  if (Test-Path $stdoutPath) { Get-Content $stdoutPath }
+                  if (Test-Path $stderrPath) { Get-Content $stderrPath }
+                  Write-Error "Cloudflare tunnel exited during startup with code $($process.ExitCode)."
+                  exit 1
+              }
+              Write-Host "[+] Cloudflare tunnel is running for $env:FULL_DOMAIN." -ForegroundColor Green
+              return $process
+          }
+
+          $tunnel = Start-Tunnel
+          $restartCount = 0
+          try {
+              while ($true) {
+                  Start-Sleep -Seconds 15
+                  $tunnel.Refresh()
+                  if ($tunnel.HasExited) {
+                      $restartCount++
+                      if ($restartCount -gt 5) {
+                          Write-Host "=== CLOUDFLARED LAST ERROR ===" -ForegroundColor Red
+                          if (Test-Path $stderrPath) { Get-Content $stderrPath }
+                          Write-Error "Cloudflare tunnel stopped repeatedly; giving up after 5 restarts."
+                          exit 1
+                      }
+                      Write-Host "[!] Cloudflare tunnel disconnected; restarting ($restartCount/5)..." -ForegroundColor Yellow
+                      $tunnel = Start-Tunnel
+                  } else {
+                      Write-Host "[$(Get-Date)] RDP tunnel active for $env:FULL_DOMAIN" -ForegroundColor DarkGreen
+                  }
+              }
+          } finally {
+              if ($tunnel -and -not $tunnel.HasExited) { Stop-Process -Id $tunnel.Id -Force -ErrorAction SilentlyContinue }
           }
