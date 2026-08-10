@@ -1,4 +1,4 @@
-Name: Windows SSH Workflow
+name: Windows SSH Workflow
 
 on:
   workflow_dispatch:
@@ -36,8 +36,8 @@ jobs:
           New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member $username
           
-          echo "SSH_USER=$username" >> $env:GITHUB_ENV
-          echo "SSH_PASS=$randomPass" >> $env:GITHUB_ENV
+          "SSH_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SSH_PASS=$randomPass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install Tailscale
         shell: powershell
@@ -64,7 +64,7 @@ jobs:
             Write-Error "Tailscale IP assignment failed."
             exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Intercept Shutdown and Reboot
         shell: powershell
@@ -106,11 +106,11 @@ jobs:
               $sha = $getRes.sha
               
               if ($getRes.content) {
-                  $cleanB64 = $getRes.content -replace "`n", "" -replace "`r", ""
+                  $cleanB64 = $getRes.content -replace "\s", ""
                   $existingBytes = [System.Convert]::FromBase64String($cleanB64)
                   $existingContent = [System.Text.Encoding]::UTF8.GetString($existingBytes)
 
-                  # Calculate project counter based on existing entries
+                  # Calculate project counter
                   $matches = [regex]::Matches($existingContent, "Project\s+(\d+)")
                   if ($matches.Count -gt 0) {
                       $projectCount = $matches.Count + 1
@@ -122,7 +122,6 @@ jobs:
 
           # 2. Prepare New Project Block
           $newBlock = @"
-
 Project $projectCount
 
 ==========================================
@@ -151,23 +150,24 @@ Command:      ssh $env:SSH_USER@$env:TAILSCALE_IP
           $bytes = [System.Text.Encoding]::UTF8.GetBytes($finalContent)
           $encodedContent = [System.Convert]::ToBase64String($bytes)
 
-          # 4. Payload & Commit
-          $body = @{
+          # 4. Construct Payload safely
+          $bodyObj = @{
               message = "Add Project $projectCount Details - Run $env:GITHUB_RUN_ID"
               content = $encodedContent
               branch  = "main"
           }
           if ($sha) {
-              $body["sha"] = $sha
+              $bodyObj["sha"] = $sha
           }
 
-          $jsonBody = $body | ConvertTo-Json
+          $jsonBody = ConvertTo-Json $bodyObj -Depth 2 -Compress
 
           try {
-              $putRes = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Put -Body $jsonBody
+              $putRes = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Put -Body $jsonBody -ContentType "application/json"
               Write-Host "[+] Successfully appended Project $projectCount to windows.txt!" -ForegroundColor Cyan
           } catch {
               Write-Host "[-] Failed to update GitHub file: $_" -ForegroundColor Red
+              exit 1
           }
 
       - name: Maintain Connection
