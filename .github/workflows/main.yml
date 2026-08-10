@@ -29,7 +29,7 @@ jobs:
 
           $username = "R-BOT"
           $securePass = ConvertTo-SecureString $randomPass -AsPlainText -Force
-          Write-Output "::add-mask::$randomPass"
+
           New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member $username
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
@@ -39,32 +39,18 @@ jobs:
 
       - name: Setup Cloudflare Tunnel with Custom Domain
         shell: powershell
-        env:
-          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          # Download Cloudflare Tunnel executable
+          # 1. Download Cloudflare Tunnel Executable
           $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
           $exePath = "$env:TEMP\cloudflared.exe"
-          $stderrPath = "$env:TEMP\cloudflared.log"
-          $stdoutPath = "$env:TEMP\cloudflared-out.log"
-          Remove-Item $stderrPath, $stdoutPath -Force -ErrorAction SilentlyContinue
           Invoke-WebRequest -Uri $cfUrl -OutFile $exePath
 
-          if ([string]::IsNullOrWhiteSpace($env:CLOUDFLARE_TUNNEL_TOKEN)) {
-              Write-Error "CF_TUNNEL_TOKEN GitHub secret is not configured."
-              exit 1
-          }
+          # 2. Run Tunnel using your Cloudflare Tunnel Token from Secrets
+          $tunnelToken = "${{ secrets.CF_TUNNEL_TOKEN }}"
+          
+          Start-Process $exePath -ArgumentList "tunnel run --token $tunnelToken"
 
-          # Cloudflare must route co08.art to tcp://localhost:3389 in its dashboard.
-          $cloudflared = Start-Process $exePath -ArgumentList @("tunnel", "--no-autoupdate", "run", "--token", $env:CLOUDFLARE_TUNNEL_TOKEN) -RedirectStandardError $stderrPath -RedirectStandardOutput $stdoutPath -PassThru
-          Start-Sleep -Seconds 5
-          if ($cloudflared.HasExited) {
-              if (Test-Path $stdoutPath) { Get-Content $stdoutPath }
-              if (Test-Path $stderrPath) { Get-Content $stderrPath }
-              Write-Error "Cloudflare tunnel exited unexpectedly with code $($cloudflared.ExitCode)."
-              exit 1
-          }
-          Write-Host "[+] Cloudflare custom-domain tunnel started for co08.art." -ForegroundColor Green
+          Write-Host "[+] Cloudflare Custom Domain Tunnel Started!" -ForegroundColor Green
 
       - name: Append Custom Domain RDP Details to Private GitHub Repo
         shell: powershell
@@ -134,7 +120,8 @@ jobs:
               $finalContent = $newBlock.Trim()
           }
 
-          Write-Host "[+] Prepared RDP details for $projectName (credentials are masked)." -ForegroundColor Green
+          Write-Host $finalContent -ForegroundColor Green
+
           # 3. Encode to Base64
           $bytes = [System.Text.Encoding]::UTF8.GetBytes($finalContent)
           $encodedContent = [System.Convert]::ToBase64String($bytes)
