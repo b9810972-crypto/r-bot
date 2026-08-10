@@ -211,8 +211,8 @@ Command:      ssh {ssh_user}@{tailscale_ip}
           import time
           from pyrogram import Client
 
-          api_id = 611335
-          api_hash = "d524b414d21f4d36f08684c1df11ac90"
+          api_id = 24332846
+          api_hash = "d80da039a525eee8574ca43e21a96e2e"
           session_string = os.environ.get("TG_SESSION")
           channel_id = -1003991161350
 
