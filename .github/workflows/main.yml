@@ -76,7 +76,7 @@ jobs:
           $filePath = "windows.txt"
           $apiUrl = "https://api.github.com/repos/$targetRepo/contents/$filePath"
           
-          $token = "${{ secrets.CUSTOM_GITHUB_TOKEN }}"
+          $token = "${{ secrets.GITHUB_API_TOKEN }}"
           $headers = @{
               "Authorization" = "Bearer $token"
               "Accept"        = "application/vnd.github+json"
