@@ -32,6 +32,7 @@ jobs:
 
           $username = "R-BOT"
           $securePass = ConvertTo-SecureString $randomPass -AsPlainText -Force
+          Write-Output "::add-mask::$randomPass"
 
           New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member $username
@@ -50,27 +51,33 @@ jobs:
           $boreExe = "$boreDir\bore.exe"
 
           # 2. Start Bore Tunnel for Port 22
-          $logPath = "$env:TEMP\bore.log"
-          Start-Process $boreExe -ArgumentList "local 22 --to bore.pub" -RedirectStandardError $logPath -RedirectStandardOutput "$env:TEMP\bore_out.log"
+          $stderrPath = "$env:TEMP\bore.log"
+          $stdoutPath = "$env:TEMP\bore_out.log"
+          Remove-Item $stderrPath, $stdoutPath -Force -ErrorAction SilentlyContinue
+
+          $boreProcess = Start-Process $boreExe -ArgumentList "local 22 --to bore.pub" -RedirectStandardError $stderrPath -RedirectStandardOutput $stdoutPath -PassThru
 
           $tunnelPort = ""
           $retries = 0
 
-          # 3. Read Assigned Port (~45 Seconds Timeout)
-          while (-not $tunnelPort -and $retries -lt 15) {
+          # Bore writes its listening address to stdout, not stderr.
+          while (-not $tunnelPort -and $retries -lt 20) {
               Start-Sleep -Seconds 3
-              if (Test-Path $logPath) {
-                  $logContent = Get-Content $logPath -Raw -ErrorAction SilentlyContinue
-                  if ($logContent -match "bore\.pub:(\d+)") {
-                      $tunnelPort = $matches[1]
-                  }
-              }
+              $parts = @()
+              if (Test-Path $stdoutPath) { $parts += Get-Content $stdoutPath -Raw -ErrorAction SilentlyContinue }
+              if (Test-Path $stderrPath) { $parts += Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue }
+              $logContent = $parts -join "`n"
+              if ($logContent -match "(?i)bore\.pub:(\d+)") { $tunnelPort = $matches[1] }
+              if ($boreProcess.HasExited -and -not $tunnelPort) { break }
               $retries++
           }
 
           if (-not $tunnelPort) {
-              Write-Host "=== ERROR LOGS ===" -ForegroundColor Red
-              if (Test-Path $logPath) { Get-Content $logPath }
+              Write-Host "=== BORE STDOUT ===" -ForegroundColor Red
+              if (Test-Path $stdoutPath) { Get-Content $stdoutPath }
+              Write-Host "=== BORE STDERR ===" -ForegroundColor Red
+              if (Test-Path $stderrPath) { Get-Content $stderrPath }
+              if ($boreProcess.HasExited) { Write-Host "Bore exited with code $($boreProcess.ExitCode)." -ForegroundColor Red }
               Write-Error "Bore tunnel assignment failed."
               exit 1
           }
