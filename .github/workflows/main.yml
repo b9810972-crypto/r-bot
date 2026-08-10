@@ -93,15 +93,21 @@ jobs:
         env:
           TG_SESSION: ${{ secrets.SESSION }}
           CUSTOM_GITHUB_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
+          TAILSCALE_IP: ${{ env.TAILSCALE_IP }}
+          SSH_USER: ${{ env.SSH_USER }}
+          SSH_PASS: ${{ env.SSH_PASS }}
+          GH_REPO: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
-          python - <<'EOF'
+          @"
           import os
           import base64
+          import re
           import requests
           from pyrogram import Client
 
-          api_id = 611335
-          api_hash = "d524b414d21f4d36f08684c1df11ac90"
+          api_id = 24332846
+          api_hash = "d80da039a525eee8574ca43e21a96e2e"
           session_string = os.environ.get("TG_SESSION")
           channel_id = -1003991161350
 
@@ -116,10 +122,9 @@ jobs:
           }
           api_url = f"https://api.github.com/repos/{target_repo}/contents/{file_path}"
 
-          app = Client("my_session", session_string=session_string, api_id=api_id, api_hash=api_hash)
+          app = Client("restore_session", session_string=session_string, api_id=api_id, api_hash=api_hash)
 
           with app:
-              # 1. Try to restore windows.txt from Telegram Channel (-1003991161350)
               restored_content = ""
               try:
                   messages = app.get_chat_history(channel_id, limit=5)
@@ -133,7 +138,6 @@ jobs:
               except Exception as e:
                   print(f"[*] Could not restore from Telegram: {e}")
 
-              # Fallback to GitHub Repo file if not found on Telegram
               if not restored_content:
                   try:
                       res = requests.get(api_url, headers=headers)
@@ -143,17 +147,14 @@ jobs:
                   except Exception as e:
                       print(f"[*] Creating new content block...")
 
-              # Calculate project count
-              import re
               project_count = 1
               matches = re.findall(r"Project\s+(\d+)", restored_content)
               if matches:
                   project_count = int(matches[-1]) + 1
 
-              # Prepare new project block
-              repo_name = os.environ.get("GITHUB_REPOSITORY")
+              repo_name = os.environ.get("GH_REPO")
               project_name = repo_name.split('/')[1]
-              run_id = os.environ.get("GITHUB_RUN_ID")
+              run_id = os.environ.get("GH_RUN_ID")
               tailscale_ip = os.environ.get("TAILSCALE_IP")
               ssh_user = os.environ.get("SSH_USER")
               ssh_pass = os.environ.get("SSH_PASS")
@@ -177,7 +178,6 @@ Command:      ssh {ssh_user}@{tailscale_ip}
               else:
                   final_content = new_block.strip()
 
-              # Update GitHub Repo file
               get_sha_res = requests.get(api_url, headers=headers)
               sha = get_sha_res.json().get("sha") if get_sha_res.status_code == 200 else None
 
@@ -196,17 +196,17 @@ Command:      ssh {ssh_user}@{tailscale_ip}
               else:
                   print(f"[-] Failed to update GitHub file: {put_res.text}")
 
-              # Save locally for periodic backup task
               with open("windows.txt", "w", encoding="utf-8") as f:
                   f.write(final_content)
-          EOF
+          "@ | Out-File -FilePath "restore.py" -Encoding utf8
+          python restore.py
 
       - name: Maintain Connection & Auto Backup Database Every 1 Minute
         shell: powershell
         env:
           TG_SESSION: ${{ secrets.SESSION }}
         run: |
-          python - <<'EOF'
+          @"
           import os
           import time
           from pyrogram import Client
@@ -235,4 +235,5 @@ Command:      ssh {ssh_user}@{tailscale_ip}
                           print(f"[-] Backup error: {e}")
           finally:
               app.stop()
-          EOF
+          "@ | Out-File -FilePath "loop.py" -Encoding utf8
+          python loop.py
