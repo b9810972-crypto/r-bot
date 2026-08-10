@@ -39,32 +39,41 @@ jobs:
           "SSH_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "SSH_PASS=$randomPass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Install Tailscale
+      - name: Establish localhost.run Tunnel
         shell: powershell
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          # SSH host verification prompt ko disable karna
+          mkdir "$env:USERPROFILE\.ssh" -ErrorAction SilentlyContinue
+          "Host *" | Out-File -FilePath "$env:USERPROFILE\.ssh\config" -Encoding utf8
+          "  StrictHostKeyChecking no" | Out-File -FilePath "$env:USERPROFILE\.ssh\config" -Encoding utf8 -Append
 
-      - name: Establish Tailscale Connection
-        shell: powershell
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          $tsIP = $null
+          # Background me localhost.run tunnel start karna aur output file me log karna
+          $logPath = "$env:TEMP\lh_run.log"
+          Start-Process ssh -ArgumentList "-R 80:localhost:22 nokey@localhost.run" -RedirectStandardOutput $logPath -RedirectStandardError "$env:TEMP\lh_err.log"
+
+          $tunnelUrl = ""
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-            Start-Sleep -Seconds 5
-            $retries++
+          while (-not $tunnelUrl -and $retries -lt 20) {
+              Start-Sleep -Seconds 3
+              if (Test-Path $logPath) {
+                  $logContent = Get-Content $logPath -Raw
+                  if ($logContent -match "(https?://[a-zA-Z0-0\.-]+\.(lhr\.life|localhost\.run))") {
+                      $tunnelUrl = $matches[1]
+                  }
+              }
+              $retries++
           }
-          if (-not $tsIP) {
-            Write-Error "Tailscale IP assignment failed."
-            exit 1
+
+          if (-not $tunnelUrl) {
+              Write-Error "localhost.run tunnel assignment failed."
+              exit 1
           }
-          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # Clean URL Domain string for SSH Command
+          $sshDomain = $tunnelUrl -replace "https://", "" -replace "http://", ""
+
+          "PUBLIC_URL=$tunnelUrl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SSH_DOMAIN=$sshDomain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Intercept Shutdown and Reboot
         shell: powershell
@@ -131,10 +140,10 @@ jobs:
               "Run ID:       $env:GITHUB_RUN_ID",
               "------------------------------------------",
               "Windows SSH Connection Details:",
-              "IP Address:   $env:TAILSCALE_IP",
+              "Public URL:   $env:PUBLIC_URL",
               "Username:     $env:SSH_USER",
               "Password:     $env:SSH_PASS",
-              "Command:      ssh $env:SSH_USER@$env:TAILSCALE_IP",
+              "Command:      ssh -p 80 $env:SSH_USER@$env:SSH_DOMAIN",
               "=========================================="
           )
           $newBlock = $blockLines -join "`n"
