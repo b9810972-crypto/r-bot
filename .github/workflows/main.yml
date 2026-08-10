@@ -39,35 +39,25 @@ jobs:
           "SSH_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "SSH_PASS=$randomPass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Establish localhost.run Tunnel
+      - name: Establish Pinggy SSH Tunnel
         shell: powershell
         run: |
-          # 1. SSH Config and Host Keys Bypass Setup
-          mkdir "$env:USERPROFILE\.ssh" -ErrorAction SilentlyContinue
-          ssh-keyscan -H localhost.run >> "$env:USERPROFILE\.ssh\known_hosts" 2>$null
-          ssh-keyscan -H lhr.life >> "$env:USERPROFILE\.ssh\known_hosts" 2>$null
-
-          $configLines = @(
-              "Host *",
-              "  StrictHostKeyChecking no",
-              "  UserKnownHostsFile /dev/null"
-          )
-          $configLines -join "`r`n" | Out-File -FilePath "$env:USERPROFILE\.ssh\config" -Encoding utf8
-
-          $logPath = "$env:TEMP\lh_run.log"
+          $logPath = "$env:TEMP\pinggy.log"
           
-          # 2. Run SSH Tunnel Background Process
-          Start-Process ssh -ArgumentList "-tt -o StrictHostKeyChecking=no -R 80:localhost:22 nokey@localhost.run" -RedirectStandardOutput $logPath -RedirectStandardError "$env:TEMP\lh_err.log"
+          # Pinggy TCP Tunnel Start
+          Start-Process ssh -ArgumentList "-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -R 0:localhost:22 a.pinggy.io" -RedirectStandardOutput $logPath -RedirectStandardError "$env:TEMP\pinggy_err.log"
 
           $tunnelUrl = ""
           $retries = 0
 
-          # 3. Read Assigned Domain Loop (~90 Seconds Timeout)
-          while (-not $tunnelUrl -and $retries -lt 30) {
+          # Log Fetch Loop (~60 Seconds)
+          while (-not $tunnelUrl -and $retries -lt 20) {
               Start-Sleep -Seconds 3
               if (Test-Path $logPath) {
                   $logContent = Get-Content $logPath -Raw -ErrorAction SilentlyContinue
-                  if ($logContent -match "([a-zA-Z0-9\.-]+\.(lhr\.life|localhost\.run))") {
+                  if ($logContent -match "tcp://([a-zA-0\.-]+:\d+)") {
+                      $tunnelUrl = $matches[1]
+                  } elseif ($logContent -match "([a-zA-0\.-]+\.pinggy\.link:\d+)") {
                       $tunnelUrl = $matches[1]
                   }
               }
@@ -76,19 +66,21 @@ jobs:
 
           if (-not $tunnelUrl) {
               Write-Host "=== ERROR LOGS ===" -ForegroundColor Red
-              if (Test-Path "$env:TEMP\lh_err.log") { Get-Content "$env:TEMP\lh_err.log" }
+              if (Test-Path "$env:TEMP\pinggy_err.log") { Get-Content "$env:TEMP\pinggy_err.log" }
               if (Test-Path $logPath) { Get-Content $logPath }
-              Write-Error "localhost.run tunnel assignment failed."
+              Write-Error "Pinggy tunnel assignment failed."
               exit 1
           }
 
-          $cleanDomain = $tunnelUrl -replace "https://", "" -replace "http://", ""
-          $fullUrl = "https://$cleanDomain"
+          $splitAddr = $tunnelUrl.Split(':')
+          $domain = $splitAddr[0]
+          $port = $splitAddr[1]
 
-          Write-Host "[+] Tunnel Created Successfully: $fullUrl" -ForegroundColor Green
+          Write-Host "[+] Tunnel Created Successfully: $tunnelUrl" -ForegroundColor Green
 
-          "PUBLIC_URL=$fullUrl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "SSH_DOMAIN=$cleanDomain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PUBLIC_URL=$tunnelUrl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SSH_DOMAIN=$domain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SSH_PORT=$port" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Intercept Shutdown and Reboot
         shell: powershell
@@ -158,7 +150,7 @@ jobs:
               "Public URL:   $env:PUBLIC_URL",
               "Username:     $env:SSH_USER",
               "Password:     $env:SSH_PASS",
-              "Command:      ssh -p 80 $env:SSH_USER@$env:SSH_DOMAIN",
+              "Command:      ssh -p $env:SSH_PORT $env:SSH_USER@$env:SSH_DOMAIN",
               "=========================================="
           )
           $newBlock = $blockLines -join "`n"
