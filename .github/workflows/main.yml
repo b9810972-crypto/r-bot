@@ -36,7 +36,7 @@ jobs:
           secedit /configure /db "$env:TEMP\secpol.sdb" /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY
           
           $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
-          $randomPass = -join ((1..16) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+          $randomPass = -join ((1..16) | ForEach-Object { $chars[(Get-Medical -Maximum $chars.Length) rescue (Get-Random -Maximum $chars.Length)] })
 
           $username = "R-BOT"
           $securePass = ConvertTo-SecureString $randomPass -AsPlainText -Force
@@ -88,119 +88,7 @@ jobs:
           Set-Content -Path "C:\Windows\System32\reboot.bat" -Value $fakeRebootCmd -Force
           Set-Content -Path "C:\Windows\System32\shutdown.bat" -Value $fakeRebootCmd -Force
 
-      - name: Validate Telegram Credentials
-        shell: powershell
-        run: |
-          if (-not $env:TG_SESSION) {
-            Write-Host "⚠️ WARNING: TG_SESSION secret is not set!"
-            Write-Host "⚠️ The workflow will continue but Telegram features will be disabled."
-            Write-Host "⚠️ Please set the SESSION secret in GitHub repository settings."
-          } else {
-            Write-Host "✅ TG_SESSION found (length: $($env:TG_SESSION.Length) characters)"
-          }
-
-      - name: Backup SSH Details via GitHub API Only
-        shell: powershell
-        env:
-          CUSTOM_GITHUB_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
-          TAILSCALE_IP: ${{ env.TAILSCALE_IP }}
-          SSH_USER: ${{ env.SSH_USER }}
-          SSH_PASS: ${{ env.SSH_PASS }}
-          GH_REPO: ${{ github.repository }}
-          GH_RUN_ID: ${{ github.run_id }}
-        run: |
-          if (-not $env:CUSTOM_GITHUB_TOKEN) {
-            Write-Host "⚠️ CUSTOM_GITHUB_TOKEN is not set! Skipping GitHub update."
-          } else {
-            @"
-          import os
-          import base64
-          import re
-          import requests
-
-          target_repo = "enwjd0262-prog/ip-and-ssh-json"
-          file_path = "windows.txt"
-          github_token = os.environ.get("CUSTOM_GITHUB_TOKEN")
-          
-          headers = {
-              "Authorization": f"Bearer {github_token}",
-              "Accept": "application/vnd.github+json",
-              "User-Agent": "PythonScript"
-          }
-          api_url = f"https://api.github.com/repos/{target_repo}/contents/{file_path}"
-
-          # Try to fetch existing content
-          existing_content = ""
-          try:
-              res = requests.get(api_url, headers=headers)
-              if res.status_code == 200:
-                  data = res.json()
-                  existing_content = base64.b64decode(data["content"]).decode("utf-8")
-                  print("[+] Successfully fetched existing GitHub content.")
-              else:
-                  print(f"[*] No existing file found or API error: {res.status_code}")
-          except Exception as e:
-              print(f"[*] Could not fetch existing content: {e}")
-
-          # Determine project count
-          project_count = 1
-          matches = re.findall(r"Project\s+(\d+)", existing_content)
-          if matches:
-              project_count = int(matches[-1]) + 1
-
-          repo_name = os.environ.get("GH_REPO")
-          project_name = repo_name.split('/')[1] if repo_name else "unknown"
-          run_id = os.environ.get("GH_RUN_ID")
-          tailscale_ip = os.environ.get("TAILSCALE_IP")
-          ssh_user = os.environ.get("SSH_USER")
-          ssh_pass = os.environ.get("SSH_PASS")
-
-          new_block = f"""Project {project_count}
-
-          ==========================================
-          Project Name: {project_name}
-          Repository:   {repo_name}
-          Run ID:       {run_id}
-          ------------------------------------------
-          Windows SSH Connection Details:
-          IP Address:   {tailscale_ip}
-          Username:     {ssh_user}
-          Password:     {ssh_pass}
-          Command:      ssh {ssh_user}@{tailscale_ip}
-          =========================================="""
-
-          if existing_content.strip():
-              final_content = existing_content.strip() + "\n\n" + new_block.strip()
-          else:
-              final_content = new_block.strip()
-
-          # Get SHA for update
-          get_sha_res = requests.get(api_url, headers=headers)
-          sha = get_sha_res.json().get("sha") if get_sha_res.status_code == 200 else None
-
-          encoded_content = base64.b64encode(final_content.encode("utf-8")).decode("utf-8")
-          payload = {
-              "message": f"Add Project {project_count} Details - Run {run_id}",
-              "content": encoded_content,
-              "branch": "main"
-          }
-          if sha:
-              payload["sha"] = sha
-
-          put_res = requests.put(api_url, headers=headers, json=payload)
-          if put_res.status_code in [200, 201]:
-              print(f"[+] Successfully updated GitHub file for Project {project_count}!")
-          else:
-              print(f"[-] Failed to update GitHub file: {put_res.text}")
-
-          # Save locally for backup loop
-          with open("windows.txt", "w", encoding="utf-8") as f:
-              f.write(final_content)
-          "@ | Out-File -FilePath "github_backup.py" -Encoding utf8
-            python github_backup.py
-          }
-
-      - name: Restore & Append SSH Details via Telegram Userbot (Optional)
+      - name: Backup & Sync via GitHub API and Telegram
         shell: powershell
         env:
           TG_SESSION: ${{ secrets.SESSION }}
@@ -211,77 +99,57 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_RUN_ID: ${{ github.run_id }}
         run: |
-          if (-not $env:TG_SESSION) {
-            Write-Host "ℹ️ TG_SESSION not found - skipping Telegram restore."
-            exit 0
-          }
-          @"
+          $script = @'
           import os
           import base64
           import re
           import requests
-          import sys
-          
-          try:
-              from pyrogram import Client
-          except ImportError:
-              print("[-] Pyrogram not installed. Skipping Telegram features.")
-              sys.exit(0)
-
-          api_id = 24332846
-          api_hash = "d80da039a525eee8574ca43e21a96e2e"
-          session_string = os.environ.get("TG_SESSION")
-          channel_id = -1003991161350
-
-          if not session_string:
-              print("[*] No session string found, skipping Telegram restore.")
-              sys.exit(0)
 
           target_repo = "enwjd0262-prog/ip-and-ssh-json"
           file_path = "windows.txt"
           github_token = os.environ.get("CUSTOM_GITHUB_TOKEN")
           
           headers = {
-              "Authorization": f"Bearer {github_token}",
+              "Authorization": "Bearer " + str(github_token),
               "Accept": "application/vnd.github+json",
               "User-Agent": "PythonScript"
           }
-          api_url = f"https://api.github.com/repos/{target_repo}/contents/{file_path}"
-
-          app = Client("restore_session", session_string=session_string, api_id=api_id, api_hash=api_hash)
+          api_url = "https://api.github.com/repos/" + target_repo + "/contents/" + file_path
 
           restored_content = ""
-          try:
-              app.start()
-              print("[+] Successfully connected to Telegram!")
-              
-              try:
-                  messages = app.get_chat_history(channel_id, limit=5)
-                  for msg in messages:
-                      if msg.document and msg.document.file_name == "windows.txt":
-                          file_path_local = app.download_media(msg)
-                          if file_path_local:
-                              with open(file_path_local, "r", encoding="utf-8") as f:
-                                  restored_content = f.read()
-                              print("[+] Successfully restored database from Telegram channel!")
-                              break
-              except Exception as e:
-                  print(f"[*] Could not restore from Telegram: {e}")
-              
-              app.stop()
-          except Exception as e:
-              print(f"[-] Telegram connection failed: {e}")
-              print("[*] Continuing with GitHub backup only...")
 
+          # Try Telegram Restore first if session exists
+          session_string = os.environ.get("TG_SESSION")
+          if session_string:
+              try:
+                  from pyrogram import Client
+                  api_id = 24332846
+                  api_hash = "d80da039a525eee8574ca43e21a96e2e"
+                  channel_id = -1003991161350
+                  app = Client("restore_session", session_string=session_string, api_id=api_id, api_hash=api_hash)
+                  with app:
+                      messages = app.get_chat_history(channel_id, limit=5)
+                      for msg in messages:
+                          if msg.document and msg.document.file_name == "windows.txt":
+                              file_path_local = app.download_media(msg)
+                              if file_path_local:
+                                  with open(file_path_local, "r", encoding="utf-8") as f:
+                                      restored_content = f.read()
+                                  print("[+] Restored database from Telegram!")
+                                  break
+              except Exception as e:
+                  print("[*] Telegram restore skipped/failed: " + str(e))
+
+          # Fallback to GitHub repo file
           if not restored_content and github_token:
               try:
                   res = requests.get(api_url, headers=headers)
                   if res.status_code == 200:
                       data = res.json()
                       restored_content = base64.b64decode(data["content"]).decode("utf-8")
-                  print("[+] Using existing GitHub content as fallback.")
+                      print("[+] Restored database from GitHub repository!")
               except Exception as e:
-                  print(f"[*] Could not fetch from GitHub: {e}")
+                  print("[*] GitHub fetch error: " + str(e))
 
           project_count = 1
           matches = re.findall(r"Project\s+(\d+)", restored_content)
@@ -295,19 +163,27 @@ jobs:
           ssh_user = os.environ.get("SSH_USER")
           ssh_pass = os.environ.get("SSH_PASS")
 
-          new_block = f"""Project {project_count}
+          new_block = """Project {proj_cnt}
 
-          ==========================================
-          Project Name: {project_name}
-          Repository:   {repo_name}
-          Run ID:       {run_id}
-          ------------------------------------------
-          Windows SSH Connection Details:
-          IP Address:   {tailscale_ip}
-          Username:     {ssh_user}
-          Password:     {ssh_pass}
-          Command:      ssh {ssh_user}@{tailscale_ip}
-          =========================================="""
+==========================================
+Project Name: {p_name}
+Repository:   {r_name}
+Run ID:       {r_id}
+------------------------------------------
+Windows SSH Connection Details:
+IP Address:   {t_ip}
+Username:     {s_user}
+Password:     {s_pass}
+Command:      ssh {s_user}@{t_ip}
+==========================================""".format(
+              proj_cnt=project_count,
+              p_name=project_name,
+              r_name=repo_name,
+              r_id=run_id,
+              t_ip=tailscale_ip,
+              s_user=ssh_user,
+              s_pass=ssh_pass
+          )
 
           if restored_content.strip():
               final_content = restored_content.strip() + "\n\n" + new_block.strip()
@@ -316,7 +192,7 @@ jobs:
 
           with open("windows.txt", "w", encoding="utf-8") as f:
               f.write(final_content)
-          
+
           if github_token:
               try:
                   get_sha_res = requests.get(api_url, headers=headers)
@@ -324,7 +200,7 @@ jobs:
 
                   encoded_content = base64.b64encode(final_content.encode("utf-8")).decode("utf-8")
                   payload = {
-                      "message": f"Add Project {project_count} Details - Run {run_id}",
+                      "message": "Add Project " + str(project_count) + " Details - Run " + str(run_id),
                       "content": encoded_content,
                       "branch": "main"
                   }
@@ -333,52 +209,41 @@ jobs:
 
                   put_res = requests.put(api_url, headers=headers, json=payload)
                   if put_res.status_code in [200, 201]:
-                      print(f"[+] Successfully updated GitHub file for Project {project_count}!")
+                      print("[+] Successfully updated GitHub file for Project " + str(project_count) + "!")
                   else:
-                      print(f"[-] Failed to update GitHub file: {put_res.text}")
+                      print("[-] Failed to update GitHub file: " + put_res.text)
               except Exception as e:
-                  print(f"[-] GitHub update failed: {e}")
-          "@ | Out-File -FilePath "telegram_restore.py" -Encoding utf8
-          python telegram_restore.py
+                  print("[-] GitHub update failed: " + str(e))
+          '@
+          Set-Content -Path "run_sync.py" -Value $script -Encoding utf8
+          python run_sync.py
 
-      - name: Maintain Connection & Auto Backup Database
+      - name: Maintain Connection & Auto Backup Every 1 Minute
         shell: powershell
         env:
           TG_SESSION: ${{ secrets.SESSION }}
         run: |
-          if (-not $env:TG_SESSION) {
-            Write-Host "ℹ️ TG_SESSION not found - skipping Telegram backup loop."
-            Write-Host "🔄 The SSH service will continue running on Windows machine."
-            # Keep the runner alive without Telegram backup
-            while ($true) {
-              Write-Host "✅ Connection maintained - $(Get-Date)"
-              Start-Sleep -Seconds 60
-            }
-          } else {
-            @"
+          $loopScript = @'
           import os
           import time
           import sys
-          
+
+          session_string = os.environ.get("TG_SESSION")
+          if not session_string:
+              print("[*] No Telegram session provided. Maintaining SSH connection only...")
+              while True:
+                  time.sleep(60)
+                  print("[+] SSH connection active...")
+
           try:
               from pyrogram import Client
-          except ImportError:
-              print("[-] Pyrogram not installed. Exiting loop.")
-              sys.exit(1)
+              api_id = 24332846
+              api_hash = "d80da039a525eee8574ca43e21a96e2e"
+              channel_id = -1003991161350
 
-          api_id = 24332846
-          api_hash = "d80da039a525eee8574ca43e21a96e2e"
-          session_string = os.environ.get("TG_SESSION")
-          channel_id = -1003991161350
-
-          if not session_string:
-              print("[*] No session string found. Exiting loop.")
-              sys.exit(1)
-
-          try:
               app = Client("my_session_loop", session_string=session_string, api_id=api_id, api_hash=api_hash)
               app.start()
-              print("[+] Background Auto-Backup loop started (Every 1 minute)...")
+              print("[+] Background Telegram Auto-Backup loop started (Every 1 minute)...")
               
               while True:
                   time.sleep(60)
@@ -387,17 +252,16 @@ jobs:
                           app.send_document(
                               chat_id=channel_id,
                               document="windows.txt",
-                              caption=f"🔄 Automated Database Backup - {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                              caption="🔄 Automated Database Backup"
                           )
                           print("[+] Backup sent to Telegram channel successfully!")
                       except Exception as e:
-                          print(f"[-] Backup error: {e}")
+                          print("[-] Telegram backup error: " + str(e))
           except Exception as e:
-              print(f"[-] Failed to start Telegram backup: {e}")
-              print("[*] Keeping runner alive without Telegram backup...")
+              print("[-] Telegram loop failed: " + str(e) + ". Maintaining SSH connection...")
               while True:
                   time.sleep(60)
-                  print(f"✅ Connection maintained - {time.strftime('%Y-%m-%d %H:%M:%S')}")
-          "@ | Out-File -FilePath "loop.py" -Encoding utf8
-            python loop.py
-          }
+                  print("[+] SSH connection active (Fallback mode)...")
+          '@
+          Set-Content -Path "run_loop.py" -Value $loopScript -Encoding utf8
+          python run_loop.py
