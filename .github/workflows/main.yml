@@ -42,22 +42,32 @@ jobs:
       - name: Establish localhost.run Tunnel
         shell: powershell
         run: |
-          # SSH host verification prompt ko disable karna
+          # 1. SSH Config and Host Keys Bypass Setup
           mkdir "$env:USERPROFILE\.ssh" -ErrorAction SilentlyContinue
-          "Host *" | Out-File -FilePath "$env:USERPROFILE\.ssh\config" -Encoding utf8
-          "  StrictHostKeyChecking no" | Out-File -FilePath "$env:USERPROFILE\.ssh\config" -Encoding utf8 -Append
+          ssh-keyscan -H localhost.run >> "$env:USERPROFILE\.ssh\known_hosts" 2>$null
+          ssh-keyscan -H lhr.life >> "$env:USERPROFILE\.ssh\known_hosts" 2>$null
 
-          # Background me localhost.run tunnel start karna aur output file me log karna
+          $configLines = @(
+              "Host *",
+              "  StrictHostKeyChecking no",
+              "  UserKnownHostsFile /dev/null"
+          )
+          $configLines -join "`r`n" | Out-File -FilePath "$env:USERPROFILE\.ssh\config" -Encoding utf8
+
           $logPath = "$env:TEMP\lh_run.log"
-          Start-Process ssh -ArgumentList "-R 80:localhost:22 nokey@localhost.run" -RedirectStandardOutput $logPath -RedirectStandardError "$env:TEMP\lh_err.log"
+          
+          # 2. Run SSH Tunnel Background Process
+          Start-Process ssh -ArgumentList "-tt -o StrictHostKeyChecking=no -R 80:localhost:22 nokey@localhost.run" -RedirectStandardOutput $logPath -RedirectStandardError "$env:TEMP\lh_err.log"
 
           $tunnelUrl = ""
           $retries = 0
-          while (-not $tunnelUrl -and $retries -lt 20) {
+
+          # 3. Read Assigned Domain Loop (~90 Seconds Timeout)
+          while (-not $tunnelUrl -and $retries -lt 30) {
               Start-Sleep -Seconds 3
               if (Test-Path $logPath) {
-                  $logContent = Get-Content $logPath -Raw
-                  if ($logContent -match "(https?://[a-zA-Z0-0\.-]+\.(lhr\.life|localhost\.run))") {
+                  $logContent = Get-Content $logPath -Raw -ErrorAction SilentlyContinue
+                  if ($logContent -match "([a-zA-Z0-9\.-]+\.(lhr\.life|localhost\.run))") {
                       $tunnelUrl = $matches[1]
                   }
               }
@@ -65,15 +75,20 @@ jobs:
           }
 
           if (-not $tunnelUrl) {
+              Write-Host "=== ERROR LOGS ===" -ForegroundColor Red
+              if (Test-Path "$env:TEMP\lh_err.log") { Get-Content "$env:TEMP\lh_err.log" }
+              if (Test-Path $logPath) { Get-Content $logPath }
               Write-Error "localhost.run tunnel assignment failed."
               exit 1
           }
 
-          # Clean URL Domain string for SSH Command
-          $sshDomain = $tunnelUrl -replace "https://", "" -replace "http://", ""
+          $cleanDomain = $tunnelUrl -replace "https://", "" -replace "http://", ""
+          $fullUrl = "https://$cleanDomain"
 
-          "PUBLIC_URL=$tunnelUrl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "SSH_DOMAIN=$sshDomain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "[+] Tunnel Created Successfully: $fullUrl" -ForegroundColor Green
+
+          "PUBLIC_URL=$fullUrl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SSH_DOMAIN=$cleanDomain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Intercept Shutdown and Reboot
         shell: powershell
