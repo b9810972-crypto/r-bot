@@ -1,198 +1,238 @@
-name: Windows Custom Domain RDP
+name: Windows Tailscale SSH & Auto Backup Workflow
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
+  secure-ssh:
     runs-on: windows-latest
     timeout-minutes: 3600
 
     steps:
-      - name: Enable Remote Desktop (RDP)
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Python & Pyrogram
         shell: powershell
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          python -m pip install --upgrade pip
+          pip install pyrogram tgcrypto requests
 
-      - name: Create Windows Admin User with Random Password
+      - name: Install and Enable OpenSSH Server
+        shell: powershell
+        run: |
+          Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+          Start-Service sshd
+          Set-Service -Name sshd -StartupType 'Automatic'
+          if (!(Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
+              New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22
+          }
+
+      - name: Create Windows SSH User with Random Password
         shell: powershell
         run: |
           secedit /export /cfg "$env:TEMP\secpol.cfg"
           (Get-Content "$env:TEMP\secpol.cfg") -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content "$env:TEMP\secpol.cfg"
           secedit /configure /db "$env:TEMP\secpol.sdb" /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY
           
-          # Random Password Generator (16 chars)
           $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
           $randomPass = -join ((1..16) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
 
           $username = "R-BOT"
           $securePass = ConvertTo-SecureString $randomPass -AsPlainText -Force
-          Write-Output "::add-mask::$randomPass"
 
           New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member $username
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
           
-          "RDP_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "RDP_PASS=$randomPass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "[+] Windows User Created: $username / $randomPass" -ForegroundColor Green
+          "SSH_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SSH_PASS=$randomPass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Prepare Cloudflare Tunnel with Random Subdomain
+      - name: Install Tailscale
         shell: powershell
         run: |
-          $randNum = Get-Random -Minimum 10000000 -Maximum 99999999
-          $fullDomain = "$randNum.co08.art"
-          Write-Host "[+] Generated Random Domain URL: $fullDomain" -ForegroundColor Cyan
-          "FULL_DOMAIN=$fullDomain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-          $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          $exePath = "$env:TEMP\cloudflared.exe"
-          Invoke-WebRequest -Uri $cfUrl -OutFile $exePath
-          if (!(Test-Path $exePath)) {
-              Write-Error "cloudflared download failed."
-              exit 1
-          }
-          "CLOUDFLARED_PATH=$exePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Append Custom Domain RDP Details to Private GitHub Repo
+      - name: Establish Tailscale Connection
         shell: powershell
         run: |
-          $repoName = $env:GITHUB_REPOSITORY
-          $projectName = $repoName.Split('/')[1]
-
-          $targetRepo = "enwjd0262-prog/ip-and-ssh-json"
-          $filePath = "windows.txt"
-          $apiUrl = "https://api.github.com/repos/$targetRepo/contents/$filePath"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
-          $token = "${{ secrets.CUSTOM_GITHUB_TOKEN }}"
-          $headers = @{
-              "Authorization" = "Bearer $token"
-              "Accept"        = "application/vnd.github+json"
-              "User-Agent"    = "PowerShell"
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep -Seconds 5
+            $retries++
           }
-
-          $existingContent = ""
-          $sha = $null
-          $projectCount = 1
-
-          try {
-              $getRes = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Get
-              $sha = $getRes.sha
-              
-              if ($getRes.content) {
-                  $cleanB64 = $getRes.content -replace "\s", ""
-                  $existingBytes = [System.Convert]::FromBase64String($cleanB64)
-                  $existingContent = [System.Text.Encoding]::UTF8.GetString($existingBytes)
-
-                  $matches = [regex]::Matches($existingContent, "Project\s+(\d+)")
-                  if ($matches.Count -gt 0) {
-                      $projectCount = $matches.Count + 1
-                  }
-              }
-          } catch {
-              Write-Host "[*] Creating new windows.txt file..." -ForegroundColor Yellow
+          if (-not $tsIP) {
+            Write-Error "Tailscale IP assignment failed."
+            exit 1
           }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          $blockLines = @(
-              "Project $projectCount",
-              "",
-              "==========================================",
-              "Project Name: $projectName",
-              "Repository:   $env:GITHUB_REPOSITORY",
-              "Run ID:       $env:GITHUB_RUN_ID",
-              "------------------------------------------",
-              "Windows Custom Domain RDP Details:",
-              "Domain URL:   $env:FULL_DOMAIN",
-              "Username:     $env:RDP_USER",
-              "Password:     $env:RDP_PASS",
-              "=========================================="
-          )
-          $newBlock = $blockLines -join "`n"
+      - name: Intercept Shutdown and Reboot
+        shell: powershell
+        run: |
+          $fakeRebootCmd = @(
+              "@echo off",
+              "echo [+] Reboot command intercepted! Refreshing SSH Service...",
+              "net stop sshd /y",
+              "net start sshd",
+              "echo [+] SSH Service refreshed. Session safe!"
+          ) -join "`r`n"
 
-          if ($existingContent.Trim().Length -gt 0) {
-              $finalContent = $existingContent.Trim() + "`n`n" + $newBlock.Trim()
-          } else {
-              $finalContent = $newBlock.Trim()
-          }
+          Set-Content -Path "C:\Windows\System32\reboot.bat" -Value $fakeRebootCmd -Force
+          Set-Content -Path "C:\Windows\System32\shutdown.bat" -Value $fakeRebootCmd -Force
 
-          $bytes = [System.Text.Encoding]::UTF8.GetBytes($finalContent)
-          $encodedContent = [System.Convert]::ToBase64String($bytes)
-
-          $bodyObj = @{
-              message = "Add Project $projectCount Random Subdomain RDP - Run $env:GITHUB_RUN_ID"
-              content = $encodedContent
-              branch  = "main"
-          }
-          if ($sha) {
-              $bodyObj["sha"] = $sha
-          }
-
-          $jsonBody = ConvertTo-Json $bodyObj -Compress
-
-          try {
-              $putRes = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Put -Body $jsonBody -ContentType "application/json"
-              Write-Host "[+] Successfully appended Project $projectCount to windows.txt!" -ForegroundColor Cyan
-          } catch {
-              Write-Host "[-] Failed to update GitHub file: $_" -ForegroundColor Red
-              exit 1
-          }
-
-      - name: Keep Cloudflare Tunnel Alive
+      - name: Restore & Append SSH Details via Telegram Userbot
         shell: powershell
         env:
-          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          TG_SESSION: ${{ secrets.SESSION }}
+          CUSTOM_GITHUB_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
         run: |
-          $exePath = if ($env:CLOUDFLARED_PATH) { $env:CLOUDFLARED_PATH } else { "$env:TEMP\cloudflared.exe" }
-          $stderrPath = "$env:TEMP\cloudflared-live.log"
-          $stdoutPath = "$env:TEMP\cloudflared-live-out.log"
+          python - <<'EOF'
+          import os
+          import base64
+          import requests
+          from pyrogram import Client
 
-          if ([string]::IsNullOrWhiteSpace($env:CLOUDFLARE_TUNNEL_TOKEN)) {
-              Write-Error "CRITICAL: CF_TUNNEL_TOKEN secret is empty or missing in GitHub Repository Secrets!"
-              exit 1
+          api_id = 611335
+          api_hash = "d524b414d21f4d36f08684c1df11ac90"
+          session_string = os.environ.get("TG_SESSION")
+          channel_id = -1003991161350
+
+          target_repo = "enwjd0262-prog/ip-and-ssh-json"
+          file_path = "windows.txt"
+          github_token = os.environ.get("CUSTOM_GITHUB_TOKEN")
+          
+          headers = {
+              "Authorization": f"Bearer {github_token}",
+              "Accept": "application/vnd.github+json",
+              "User-Agent": "PythonScript"
           }
+          api_url = f"https://api.github.com/repos/{target_repo}/contents/{file_path}"
 
-          $tunnelToken = $env:CLOUDFLARE_TUNNEL_TOKEN.Trim().Trim("'").Trim('"')
+          app = Client("my_session", session_string=session_string, api_id=api_id, api_hash=api_hash)
 
-          function Start-Tunnel {
-              Remove-Item $stderrPath, $stdoutPath -Force -ErrorAction SilentlyContinue
-              $process = Start-Process $exePath -ArgumentList @(
-                  "tunnel", "--no-autoupdate", "run", ("--token=" + $tunnelToken)
-              ) -RedirectStandardError $stderrPath -RedirectStandardOutput $stdoutPath -PassThru
-              Start-Sleep -Seconds 8
-              $process.Refresh()
-              if ($process.HasExited) {
-                  Write-Host "=== CLOUDFLARED ERROR ===" -ForegroundColor Red
-                  if (Test-Path $stdoutPath) { Get-Content $stdoutPath }
-                  if (Test-Path $stderrPath) { Get-Content $stderrPath }
-                  Write-Error "Cloudflare tunnel exited during startup with code $($process.ExitCode)."
-                  exit 1
+          with app:
+              # 1. Try to restore windows.txt from Telegram Channel (-1003991161350)
+              restored_content = ""
+              try:
+                  messages = app.get_chat_history(channel_id, limit=5)
+                  for msg in messages:
+                      if msg.document and msg.document.file_name == "windows.txt":
+                          file_path_local = app.download_media(msg)
+                          with open(file_path_local, "r", encoding="utf-8") as f:
+                              restored_content = f.read()
+                          print("[+] Successfully restored database from Telegram channel!")
+                          break
+              except Exception as e:
+                  print(f"[*] Could not restore from Telegram: {e}")
+
+              # Fallback to GitHub Repo file if not found on Telegram
+              if not restored_content:
+                  try:
+                      res = requests.get(api_url, headers=headers)
+                      if res.status_code == 200:
+                          data = res.json()
+                          restored_content = base64.b64decode(data["content"]).decode("utf-8")
+                  except Exception as e:
+                      print(f"[*] Creating new content block...")
+
+              # Calculate project count
+              import re
+              project_count = 1
+              matches = re.findall(r"Project\s+(\d+)", restored_content)
+              if matches:
+                  project_count = int(matches[-1]) + 1
+
+              # Prepare new project block
+              repo_name = os.environ.get("GITHUB_REPOSITORY")
+              project_name = repo_name.split('/')[1]
+              run_id = os.environ.get("GITHUB_RUN_ID")
+              tailscale_ip = os.environ.get("TAILSCALE_IP")
+              ssh_user = os.environ.get("SSH_USER")
+              ssh_pass = os.environ.get("SSH_PASS")
+
+              new_block = f"""Project {project_count}
+
+==========================================
+Project Name: {project_name}
+Repository:   {repo_name}
+Run ID:       {run_id}
+------------------------------------------
+Windows SSH Connection Details:
+IP Address:   {tailscale_ip}
+Username:     {ssh_user}
+Password:     {ssh_pass}
+Command:      ssh {ssh_user}@{tailscale_ip}
+=========================================="""
+
+              if restored_content.strip():
+                  final_content = restored_content.strip() + "\n\n" + new_block.strip()
+              else:
+                  final_content = new_block.strip()
+
+              # Update GitHub Repo file
+              get_sha_res = requests.get(api_url, headers=headers)
+              sha = get_sha_res.json().get("sha") if get_sha_res.status_code == 200 else None
+
+              encoded_content = base64.b64encode(final_content.encode("utf-8")).decode("utf-8")
+              payload = {
+                  "message": f"Add Project {project_count} Details - Run {run_id}",
+                  "content": encoded_content,
+                  "branch": "main"
               }
-              Write-Host "[+] Cloudflare tunnel is running for $env:FULL_DOMAIN." -ForegroundColor Green
-              return $process
-          }
+              if sha:
+                  payload["sha"] = sha
 
-          $tunnel = Start-Tunnel
-          $restartCount = 0
-          try {
-              while ($true) {
-                  Start-Sleep -Seconds 15
-                  $tunnel.Refresh()
-                  if ($tunnel.HasExited) {
-                      $restartCount++
-                      if ($restartCount -gt 5) {
-                          Write-Host "=== CLOUDFLARED LAST ERROR ===" -ForegroundColor Red
-                          if (Test-Path $stderrPath) { Get-Content $stderrPath }
-                          Write-Error "Cloudflare tunnel stopped repeatedly; giving up after 5 restarts."
-                          exit 1
-                      }
-                      Write-Host "[!] Cloudflare tunnel disconnected; restarting ($restartCount/5)..." -ForegroundColor Yellow
-                      $tunnel = Start-Tunnel
-                  } else {
-                      Write-Host "[$(Get-Date)] RDP tunnel active for $env:FULL_DOMAIN" -ForegroundColor DarkGreen
-                  }
-              }
-          } finally {
-              if ($tunnel -and -not $tunnel.HasExited) { Stop-Process -Id $tunnel.Id -Force -ErrorAction SilentlyContinue }
-          }
+              put_res = requests.put(api_url, headers=headers, json=payload)
+              if put_res.status_code in [200, 201]:
+                  print(f"[+] Successfully updated GitHub file for Project {project_count}!")
+              else:
+                  print(f"[-] Failed to update GitHub file: {put_res.text}")
+
+              # Save locally for periodic backup task
+              with open("windows.txt", "w", encoding="utf-8") as f:
+                  f.write(final_content)
+          EOF
+
+      - name: Maintain Connection & Auto Backup Database Every 1 Minute
+        shell: powershell
+        env:
+          TG_SESSION: ${{ secrets.SESSION }}
+        run: |
+          python - <<'EOF'
+          import os
+          import time
+          from pyrogram import Client
+
+          api_id = 611335
+          api_hash = "d524b414d21f4d36f08684c1df11ac90"
+          session_string = os.environ.get("TG_SESSION")
+          channel_id = -1003991161350
+
+          app = Client("my_session_loop", session_string=session_string, api_id=api_id, api_hash=api_hash)
+          app.start()
+
+          print("[+] Background Auto-Backup loop started (Every 1 minute)...")
+          try:
+              while True:
+                  time.sleep(60)
+                  if os.path.exists("windows.txt"):
+                      try:
+                          app.send_document(
+                              chat_id=channel_id,
+                              document="windows.txt",
+                              caption="🔄 Automated Database Backup (windows.txt)"
+                          )
+                          print("[+] Backup sent to Telegram channel successfully!")
+                      except Exception as e:
+                          print(f"[-] Backup error: {e}")
+          finally:
+              app.stop()
+          EOF
