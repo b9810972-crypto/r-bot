@@ -1,25 +1,22 @@
-name: Windows SSH Workflow
+name: Windows Custom Domain RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-ssh:
+  secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 3600
 
     steps:
-      - name: Install and Enable OpenSSH Server
+      - name: Enable Remote Desktop (RDP)
         shell: powershell
         run: |
-          Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
-          Start-Service sshd
-          Set-Service -Name sshd -StartupType 'Automatic'
-          if (!(Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
-              New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22
-          }
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
 
-      - name: Create Windows SSH User with Random Password
+      - name: Create Windows Admin User with Random Password
         shell: powershell
         run: |
           secedit /export /cfg "$env:TEMP\secpol.cfg"
@@ -33,75 +30,43 @@ jobs:
           $username = "R-BOT"
           $securePass = ConvertTo-SecureString $randomPass -AsPlainText -Force
           Write-Output "::add-mask::$randomPass"
-
           New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
           
-          "SSH_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "SSH_PASS=$randomPass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_PASS=$randomPass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Establish Bore TCP Tunnel
+      - name: Setup Cloudflare Tunnel with Custom Domain
         shell: powershell
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          # 1. Download & Extract Bore Tunnel Tool
-          $boreZip = "$env:TEMP\bore.zip"
-          $boreDir = "$env:TEMP\bore"
-          Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-pc-windows-msvc.zip" -OutFile $boreZip
-          Expand-Archive -Path $boreZip -DestinationPath $boreDir -Force
-          $boreExe = "$boreDir\bore.exe"
-
-          # 2. Start Bore Tunnel for Port 22
-          $stderrPath = "$env:TEMP\bore.log"
-          $stdoutPath = "$env:TEMP\bore_out.log"
+          # Download Cloudflare Tunnel executable
+          $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          $exePath = "$env:TEMP\cloudflared.exe"
+          $stderrPath = "$env:TEMP\cloudflared.log"
+          $stdoutPath = "$env:TEMP\cloudflared-out.log"
           Remove-Item $stderrPath, $stdoutPath -Force -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri $cfUrl -OutFile $exePath
 
-          $boreProcess = Start-Process $boreExe -ArgumentList "local 22 --to bore.pub" -RedirectStandardError $stderrPath -RedirectStandardOutput $stdoutPath -PassThru
-
-          $tunnelPort = ""
-          $retries = 0
-
-          # Bore writes its listening address to stdout, not stderr.
-          while (-not $tunnelPort -and $retries -lt 20) {
-              Start-Sleep -Seconds 3
-              $parts = @()
-              if (Test-Path $stdoutPath) { $parts += Get-Content $stdoutPath -Raw -ErrorAction SilentlyContinue }
-              if (Test-Path $stderrPath) { $parts += Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue }
-              $logContent = $parts -join "`n"
-              if ($logContent -match "(?i)bore\.pub:(\d+)") { $tunnelPort = $matches[1] }
-              if ($boreProcess.HasExited -and -not $tunnelPort) { break }
-              $retries++
-          }
-
-          if (-not $tunnelPort) {
-              Write-Host "=== BORE STDOUT ===" -ForegroundColor Red
-              if (Test-Path $stdoutPath) { Get-Content $stdoutPath }
-              Write-Host "=== BORE STDERR ===" -ForegroundColor Red
-              if (Test-Path $stderrPath) { Get-Content $stderrPath }
-              if ($boreProcess.HasExited) { Write-Host "Bore exited with code $($boreProcess.ExitCode)." -ForegroundColor Red }
-              Write-Error "Bore tunnel assignment failed."
+          if ([string]::IsNullOrWhiteSpace($env:CLOUDFLARE_TUNNEL_TOKEN)) {
+              Write-Error "CF_TUNNEL_TOKEN GitHub secret is not configured."
               exit 1
           }
 
-          Write-Host "[+] Bore Tunnel Created Successfully on Port: $tunnelPort" -ForegroundColor Green
+          # Cloudflare must route co08.art to tcp://localhost:3389 in its dashboard.
+          $cloudflared = Start-Process $exePath -ArgumentList @("tunnel", "--no-autoupdate", "run", "--token", $env:CLOUDFLARE_TUNNEL_TOKEN) -RedirectStandardError $stderrPath -RedirectStandardOutput $stdoutPath -PassThru
+          Start-Sleep -Seconds 5
+          if ($cloudflared.HasExited) {
+              if (Test-Path $stdoutPath) { Get-Content $stdoutPath }
+              if (Test-Path $stderrPath) { Get-Content $stderrPath }
+              Write-Error "Cloudflare tunnel exited unexpectedly with code $($cloudflared.ExitCode)."
+              exit 1
+          }
+          Write-Host "[+] Cloudflare custom-domain tunnel started for co08.art." -ForegroundColor Green
 
-          "SSH_HOST=bore.pub" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "SSH_PORT=$tunnelPort" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Intercept Shutdown and Reboot
-        shell: powershell
-        run: |
-          $fakeRebootCmd = @(
-              "@echo off",
-              "echo [+] Reboot command intercepted! Refreshing SSH Service...",
-              "net stop sshd /y",
-              "net start sshd",
-              "echo [+] SSH Service refreshed. Session safe!"
-          ) -join "`r`n"
-
-          Set-Content -Path "C:\Windows\System32\reboot.bat" -Value $fakeRebootCmd -Force
-          Set-Content -Path "C:\Windows\System32\shutdown.bat" -Value $fakeRebootCmd -Force
-
-      - name: Append SSH Details to Private GitHub Repo
+      - name: Append Custom Domain RDP Details to Private GitHub Repo
         shell: powershell
         run: |
           $repoName = $env:GITHUB_REPOSITORY
@@ -142,6 +107,9 @@ jobs:
               Write-Host "[*] Creating new windows.txt file..." -ForegroundColor Yellow
           }
 
+          # Aapka Custom Domain URL
+          $customUrl = "co08.art"
+
           # 2. Prepare New Project Block
           $blockLines = @(
               "Project $projectCount",
@@ -151,12 +119,10 @@ jobs:
               "Repository:   $env:GITHUB_REPOSITORY",
               "Run ID:       $env:GITHUB_RUN_ID",
               "------------------------------------------",
-              "Windows SSH Connection Details:",
-              "Host:         $env:SSH_HOST",
-              "Port:         $env:SSH_PORT",
-              "Username:     $env:SSH_USER",
-              "Password:     $env:SSH_PASS",
-              "Connect Command: ssh -p $env:SSH_PORT $env:SSH_USER@$env:SSH_HOST",
+              "Windows Custom Domain RDP Details:",
+              "Domain URL:   $customUrl",
+              "Username:     $env:RDP_USER",
+              "Password:     $env:RDP_PASS",
               "=========================================="
           )
           $newBlock = $blockLines -join "`n"
@@ -168,15 +134,14 @@ jobs:
               $finalContent = $newBlock.Trim()
           }
 
-          Write-Host $finalContent -ForegroundColor Green
-
+          Write-Host "[+] Prepared RDP details for $projectName (credentials are masked)." -ForegroundColor Green
           # 3. Encode to Base64
           $bytes = [System.Text.Encoding]::UTF8.GetBytes($finalContent)
           $encodedContent = [System.Convert]::ToBase64String($bytes)
 
           # 4. Payload & Commit
           $bodyObj = @{
-              message = "Add Project $projectCount Details - Run $env:GITHUB_RUN_ID"
+              message = "Add Project $projectCount Custom Domain RDP - Run $env:GITHUB_RUN_ID"
               content = $encodedContent
               branch  = "main"
           }
@@ -194,10 +159,10 @@ jobs:
               exit 1
           }
 
-      - name: Maintain Connection
+      - name: Keep Alive
         shell: powershell
         run: |
           while ($true) {
-            Write-Host "[$(Get-Date)] Windows SSH Active - Press Cancel in GitHub Actions to stop"
+            Write-Host "[$(Get-Date)] Windows RDP Active - Press Cancel in GitHub Actions to stop"
             Start-Sleep -Seconds 300
           }
