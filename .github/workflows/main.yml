@@ -59,7 +59,7 @@ jobs:
               Start-Sleep -Seconds 3
               if (Test-Path $logPath) {
                   $logContent = Get-Content $logPath -Raw -ErrorAction SilentlyContinue
-                  if ($logContent -match "(https://[a-zA-0\.-]+\.trycloudflare\.com)") {
+                  if ($logContent -match "(https://[a-zA-Z0-9\.-]+\.trycloudflare\.com)") {
                       $tunnelUrl = $matches[1]
                   }
               }
