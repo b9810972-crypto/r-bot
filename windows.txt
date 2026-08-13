@@ -1,0 +1,13 @@
+Project 1
+
+==========================================
+Project Name: Windows SSH Runner
+Repository:   b9810972-crypto/r-bot
+Run ID:       31685285123
+------------------------------------------
+Windows SSH Connection Details:
+IP Address:   100.66.130.98
+Username:     R-BOT
+Password:     gfk7TRr%O&Z&@hm3
+Command:      ssh R-BOT@100.66.130.98
+==========================================
