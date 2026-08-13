@@ -79,16 +79,6 @@ jobs:
 
           Set-Content -Path "C:\Windows\System32\reboot.bat" -Value $fakeRebootCmd -Force
           Set-Content -Path "C:\Windows\System32\shutdown.bat" -Value $fakeRebootCmd -Force
-
-      - name: Append SSH Details to Private GitHub Repo
-        shell: powershell
-        run: |
-          $repoName = $env:GITHUB_REPOSITORY
-          $projectName = $repoName.Split('/')[1]
-
-          $targetRepo = "enwjd0262-prog/ip-and-ssh-json"
-          $filePath = "windows.txt"
-          $apiUrl = "https://api.github.com/repos/$targetRepo/contents/$filePath"
           
           $token = "${{ secrets.CUSTOM_GITHUB_TOKEN }}"
           $headers = @{
