@@ -3,72 +3,246 @@ name: Windows SSH Workflow
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   secure-ssh:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
       - name: Install and Enable OpenSSH Server
         shell: powershell
         run: |
-          Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
-          Start-Service sshd
-          Set-Service -Name sshd -StartupType 'Automatic'
-          if (!(Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
-              New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "[+] Installing OpenSSH Server..."
+
+          $capability = Get-WindowsCapability -Online |
+              Where-Object Name -like "OpenSSH.Server*"
+
+          if ($capability.State -ne "Installed") {
+              Add-WindowsCapability -Online -Name "OpenSSH.Server~~~~0.0.1.0"
           }
+
+          Set-Service -Name sshd -StartupType Automatic
+          Start-Service sshd
+
+          if (!(Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
+              New-NetFirewallRule `
+                  -Name "OpenSSH-Server-In-TCP" `
+                  -DisplayName "OpenSSH Server (sshd)" `
+                  -Enabled True `
+                  -Direction Inbound `
+                  -Protocol TCP `
+                  -Action Allow `
+                  -LocalPort 22
+          }
+
+          Write-Host "[+] OpenSSH Server is running."
 
       - name: Create Windows SSH User with Random Password
         shell: powershell
         run: |
-          secedit /export /cfg "$env:TEMP\secpol.cfg"
-          (Get-Content "$env:TEMP\secpol.cfg") -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content "$env:TEMP\secpol.cfg"
-          secedit /configure /db "$env:TEMP\secpol.sdb" /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY
-          
-          # Random Password Generator (16 chars)
-          $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
-          $randomPass = -join ((1..16) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+          $ErrorActionPreference = "Stop"
 
           $username = "R-BOT"
-          $securePass = ConvertTo-SecureString $randomPass -AsPlainText -Force
 
-          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member $username
-          
-          "SSH_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "SSH_PASS=$randomPass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Password character sets
+          $lower   = "abcdefghijklmnopqrstuvwxyz"
+          $upper   = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+          $digits  = "0123456789"
+          $symbols = "!@#$%^&*"
+
+          # Guarantee at least one character from every category
+          $passwordChars = @(
+              $lower[(Get-Random -Maximum $lower.Length)]
+              $upper[(Get-Random -Maximum $upper.Length)]
+              $digits[(Get-Random -Maximum $digits.Length)]
+              $symbols[(Get-Random -Maximum $symbols.Length)]
+          )
+
+          $allChars = $lower + $upper + $digits + $symbols
+
+          # Add 12 additional random characters
+          1..12 | ForEach-Object {
+              $passwordChars += $allChars[(Get-Random -Maximum $allChars.Length)]
+          }
+
+          # Shuffle characters
+          $randomPass = -join ($passwordChars | Sort-Object { Get-Random })
+
+          $securePass = ConvertTo-SecureString `
+              $randomPass `
+              -AsPlainText `
+              -Force
+
+          # Remove existing account if present
+          $existingUser = Get-LocalUser `
+              -Name $username `
+              -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+              Write-Host "[*] Removing existing $username account..."
+              Remove-LocalUser -Name $username
+          }
+
+          New-LocalUser `
+              -Name $username `
+              -Password $securePass `
+              -FullName "R-BOT SSH User" `
+              -Description "Temporary SSH administrator" `
+              -AccountNeverExpires `
+              -PasswordNeverExpires
+
+          Add-LocalGroupMember `
+              -Group "Administrators" `
+              -Member $username
+
+          # Prevent password from appearing in normal GitHub logs
+          Write-Output "::add-mask::$randomPass"
+
+          "SSH_USER=$username" |
+              Out-File `
+                  -FilePath $env:GITHUB_ENV `
+                  -Encoding utf8 `
+                  -Append
+
+          "SSH_PASS=$randomPass" |
+              Out-File `
+                  -FilePath $env:GITHUB_ENV `
+                  -Encoding utf8 `
+                  -Append
+
+          Write-Host "[+] SSH user created: $username"
+          Write-Host "[+] Added $username to Administrators."
 
       - name: Install Tailscale
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+
+          Write-Host "[+] Downloading Tailscale..."
+
+          Invoke-WebRequest `
+              -Uri $tsUrl `
+              -OutFile $installerPath
+
+          Write-Host "[+] Installing Tailscale..."
+
+          Start-Process `
+              -FilePath "msiexec.exe" `
+              -ArgumentList @(
+                  "/i",
+                  "`"$installerPath`"",
+                  "/quiet",
+                  "/norestart"
+              ) `
+              -Wait
+
+          Remove-Item `
+              $installerPath `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+          $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $tailscalePath)) {
+              throw "Tailscale executable was not found."
+          }
+
+          Write-Host "[+] Tailscale installed."
 
       - name: Establish Tailscale Connection
         shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
+          $ErrorActionPreference = "Stop"
+
+          $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (!$env:TAILSCALE_AUTH_KEY) {
+              throw "TAILSCALE_AUTH_KEY secret is missing."
+          }
+
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+
+          Write-Host "[+] Connecting to Tailscale..."
+
+          & $tailscalePath up `
+              "--authkey=$env:TAILSCALE_AUTH_KEY" `
+              "--hostname=$hostname"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale connection failed."
+          }
+
           $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-            Start-Sleep -Seconds 5
-            $retries++
+
+          for ($i = 1; $i -le 20; $i++) {
+
+              $tsIP = (& $tailscalePath ip -4 2>$null).Trim()
+
+              if ($tsIP) {
+                  break
+              }
+
+              Write-Host "[*] Waiting for Tailscale IP... $i/20"
+              Start-Sleep -Seconds 3
           }
-          if (-not $tsIP) {
-            Write-Error "Tailscale IP assignment failed."
-            exit 1
+
+          if (!$tsIP) {
+              throw "Tailscale IP assignment failed."
           }
-          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          "TAILSCALE_IP=$tsIP" |
+              Out-File `
+                  -FilePath $env:GITHUB_ENV `
+                  -Encoding utf8 `
+                  -Append
+
+          Write-Host "[+] Tailscale IP: $tsIP"
+
+      - name: Test SSH Server
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "[+] Checking SSH service..."
+
+          $service = Get-Service sshd
+
+          if ($service.Status -ne "Running") {
+              Start-Service sshd
+          }
+
+          $listener = Get-NetTCPConnection `
+              -LocalPort 22 `
+              -State Listen `
+              -ErrorAction SilentlyContinue
+
+          if (!$listener) {
+              throw "SSH is not listening on TCP port 22."
+          }
+
+          Write-Host "[+] SSH is listening on port 22."
 
       - name: Intercept Shutdown and Reboot
         shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
         run: |
+          $ErrorActionPreference = "Stop"
+
+          # ==========================================================
+          # SHUTDOWN / REBOOT BAT FILE COMMANDS
+          # ==========================================================
+
           $fakeRebootCmd = @(
               "@echo off",
               "echo [+] Reboot command intercepted! Refreshing SSH Service...",
@@ -77,41 +251,101 @@ jobs:
               "echo [+] SSH Service refreshed. Session safe!"
           ) -join "`r`n"
 
-          Set-Content -Path "C:\Windows\System32\reboot.bat" -Value $fakeRebootCmd -Force
-          Set-Content -Path "C:\Windows\System32\shutdown.bat" -Value $fakeRebootCmd -Force
-          
-          $token = "${{ secrets.CUSTOM_GITHUB_TOKEN }}"
+          Set-Content `
+              -Path "C:\Windows\System32\reboot.bat" `
+              -Value $fakeRebootCmd `
+              -Force
+
+          Set-Content `
+              -Path "C:\Windows\System32\shutdown.bat" `
+              -Value $fakeRebootCmd `
+              -Force
+
+          Write-Host "[+] Created:"
+          Write-Host "    C:\Windows\System32\reboot.bat"
+          Write-Host "    C:\Windows\System32\shutdown.bat"
+
+          # ==========================================================
+          # GITHUB WINDOWS.TXT CONFIGURATION
+          # ==========================================================
+
+          $apiUrl = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/contents/windows.txt"
+
+          $projectName = "Windows SSH Runner"
+
+          $token = $env:GITHUB_TOKEN
+
+          if (!$token) {
+              throw "CUSTOM_GITHUB_TOKEN secret is missing."
+          }
+
           $headers = @{
               "Authorization" = "Bearer $token"
               "Accept"        = "application/vnd.github+json"
               "User-Agent"    = "PowerShell"
           }
 
-          # 1. Fetch Existing File Content and SHA
+          # ==========================================================
+          # FETCH EXISTING WINDOWS.TXT
+          # ==========================================================
+
           $existingContent = ""
           $sha = $null
           $projectCount = 1
 
           try {
-              $getRes = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Get
-              $sha = $getRes.sha
-              
-              if ($getRes.content) {
-                  $cleanB64 = $getRes.content -replace "\s", ""
-                  $existingBytes = [System.Convert]::FromBase64String($cleanB64)
-                  $existingContent = [System.Text.Encoding]::UTF8.GetString($existingBytes)
 
-                  # Calculate project counter
-                  $matches = [regex]::Matches($existingContent, "Project\s+(\d+)")
+              Write-Host "[+] Fetching existing windows.txt..."
+
+              $getRes = Invoke-RestMethod `
+                  -Uri $apiUrl `
+                  -Headers $headers `
+                  -Method Get
+
+              $sha = $getRes.sha
+
+              if ($getRes.content) {
+
+                  $cleanB64 = $getRes.content -replace "\s", ""
+
+                  $existingBytes =
+                      [System.Convert]::FromBase64String($cleanB64)
+
+                  $existingContent =
+                      [System.Text.Encoding]::UTF8.GetString(
+                          $existingBytes
+                      )
+
+                  # Find Project numbers
+                  $matches = [regex]::Matches(
+                      $existingContent,
+                      "(?m)^Project\s+(\d+)\s*$"
+                  )
+
                   if ($matches.Count -gt 0) {
-                      $projectCount = $matches.Count + 1
+
+                      $numbers = @(
+                          $matches | ForEach-Object {
+                              [int]$_.Groups[1].Value
+                          }
+                      )
+
+                      $projectCount =
+                          ($numbers | Measure-Object -Maximum).Maximum + 1
                   }
               }
-          } catch {
-              Write-Host "[*] Creating new windows.txt file..." -ForegroundColor Yellow
+
+          }
+          catch {
+
+              Write-Host "[*] windows.txt does not exist."
+              Write-Host "[*] Creating a new file..."
           }
 
-          # 2. Prepare New Project Block
+          # ==========================================================
+          # CREATE PROJECT BLOCK
+          # ==========================================================
+
           $blockLines = @(
               "Project $projectCount",
               "",
@@ -127,45 +361,111 @@ jobs:
               "Command:      ssh $env:SSH_USER@$env:TAILSCALE_IP",
               "=========================================="
           )
+
           $newBlock = $blockLines -join "`n"
 
-          # Combine Existing Content + New Block
           if ($existingContent.Trim().Length -gt 0) {
-              $finalContent = $existingContent.Trim() + "`n`n" + $newBlock.Trim()
-          } else {
+
+              $finalContent =
+                  $existingContent.Trim() +
+                  "`n`n" +
+                  $newBlock.Trim()
+
+          }
+          else {
+
               $finalContent = $newBlock.Trim()
           }
 
-          Write-Host $finalContent -ForegroundColor Green
+          # ==========================================================
+          # DISPLAY CONNECTION INFORMATION
+          # ==========================================================
 
-          # 3. Encode to Base64
-          $bytes = [System.Text.Encoding]::UTF8.GetBytes($finalContent)
-          $encodedContent = [System.Convert]::ToBase64String($bytes)
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "       WINDOWS SSH CONNECTION"
+          Write-Host "=========================================="
+          Write-Host "IP Address: $env:TAILSCALE_IP"
+          Write-Host "Username:   $env:SSH_USER"
+          Write-Host "Command:    ssh $env:SSH_USER@$env:TAILSCALE_IP"
+          Write-Host "=========================================="
+          Write-Host ""
 
-          # 4. Payload & Commit
+          # ==========================================================
+          # BASE64 ENCODE
+          # ==========================================================
+
+          $bytes =
+              [System.Text.Encoding]::UTF8.GetBytes(
+                  $finalContent
+              )
+
+          $encodedContent =
+              [System.Convert]::ToBase64String($bytes)
+
+          # ==========================================================
+          # GITHUB API PAYLOAD
+          # ==========================================================
+
           $bodyObj = @{
               message = "Add Project $projectCount Details - Run $env:GITHUB_RUN_ID"
               content = $encodedContent
               branch  = "main"
           }
+
           if ($sha) {
               $bodyObj["sha"] = $sha
           }
 
-          $jsonBody = ConvertTo-Json $bodyObj -Compress
+          $jsonBody =
+              ConvertTo-Json `
+                  $bodyObj `
+                  -Compress
+
+          # ==========================================================
+          # UPDATE WINDOWS.TXT
+          # ==========================================================
 
           try {
-              $putRes = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Put -Body $jsonBody -ContentType "application/json"
-              Write-Host "[+] Successfully appended Project $projectCount to windows.txt!" -ForegroundColor Cyan
-          } catch {
-              Write-Host "[-] Failed to update GitHub file: $_" -ForegroundColor Red
+
+              Invoke-RestMethod `
+                  -Uri $apiUrl `
+                  -Headers $headers `
+                  -Method Put `
+                  -Body $jsonBody `
+                  -ContentType "application/json"
+
+              Write-Host "[+] Successfully updated windows.txt!"
+
+          }
+          catch {
+
+              Write-Host "[-] Failed to update windows.txt!"
+              Write-Host $_
+
               exit 1
           }
 
       - name: Maintain Connection
         shell: powershell
         run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "       WINDOWS SSH RUNNER ACTIVE"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Username:     $env:SSH_USER"
+          Write-Host ""
+          Write-Host "SSH Command:"
+          Write-Host "ssh $env:SSH_USER@$env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host ""
+
           while ($true) {
-            Write-Host "[$(Get-Date)] Windows SSH Active - Press Cancel in GitHub Actions to stop"
-            Start-Sleep -Seconds 300
+
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Windows SSH Active"
+
+              Start-Sleep -Seconds 300
           }
